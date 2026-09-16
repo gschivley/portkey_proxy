@@ -5,6 +5,7 @@ Portkey AI Sandbox -> local OpenAI-compatible HTTP proxy for GitHub Copilot.
 Exposes:
     POST /v1/chat/completions     (also /chat/completions)
     GET  /v1/models               (also /models)
+    GET  /v1/usage                (also /usage; monthly cost/usage report)
     GET  /health, GET /
 
 Incoming OpenAI-compatible requests are translated into calls to the
@@ -49,6 +50,18 @@ Configuration (local .env file next to this script, or environment):
                            comma-separated accepted reasoning_effort values
                            for those models (default: unset, so whatever
                            the client sends is forwarded untouched)
+    GEMINI38_FLASH_PRICING_MODEL   pricing-catalog model name for
+                           gemini-3.8-flash (default gemini-3.8-flash-gt-128k)
+
+Usage & cost tracking (see usage.py; GET /v1/usage, or run usage_report.py):
+    USAGE_TRACKING       "0" to disable recording usage/cost (default on)
+    USAGE_LOG_PATH       JSONL usage log path (default usage.jsonl next to
+                           this script; gitignored)
+    MONTHLY_BUDGET_USD   monthly budget for reports/warnings (default 250)
+    PRICING_BASE_URL     pricing API base (default
+                           https://api.portkey.ai/model-configs)
+    PRICING_CACHE_PATH   pricing cache file (default .pricing_cache.json)
+    PRICING_TTL_HOURS    pricing cache TTL in hours (default 24)
 
 Run:
     python proxy.py                      # serves on 127.0.0.1:8090
@@ -76,7 +89,7 @@ from portkey_ai import Portkey
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-PROXY_VERSION = "1.4.0"
+PROXY_VERSION = "1.5.0"
 
 # --------------------------------------------------------------------------- #
 # Environment / .env loading
@@ -106,6 +119,9 @@ def _load_env_files(script_dir: Path) -> None:
 
 
 _load_env_files(SCRIPT_DIR)
+
+# Imported after .env loading: usage.py reads its config at import time.
+import usage as usage_mod  # noqa: E402
 
 PORTKEY_API_KEY = os.environ.get("PORTKEY_API_KEY") or os.environ.get("AI_SANDBOX_KEY")
 _raw_base_url = os.environ.get("PORTKEY_BASE_URL") or "https://api.portkey.ai/v1"
@@ -186,40 +202,51 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "upstream": os.environ.get("GPT56_SOL_UPSTREAM_MODEL", "gpt-5.6-sol"),
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-5.6",
+        "provider": "openai",
     },
     "gpt-5.6-terra": {
         "upstream": os.environ.get("GPT56_TERRA_UPSTREAM_MODEL", "gpt-5.6-terra"),
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-5.6",
+        "provider": "openai",
     },
     "gpt-5.6-luna": {
         "upstream": os.environ.get("GPT56_LUNA_UPSTREAM_MODEL", "gpt-5.6-luna"),
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-5.6",
+        "provider": "openai",
     },
     "gpt-6-astra": {
         "upstream": os.environ.get("GPT6_ASTRA_UPSTREAM_MODEL", "gpt-6-astra"),
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-6",
         "efforts_env": "GPT6_ASTRA_REASONING_EFFORTS",
+        "provider": "openai",
     },
     "gemini-3.8-flash": {
         "upstream": os.environ.get("GEMINI38_FLASH_UPSTREAM_MODEL", "gemini-3.8-flash"),
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "flexible",
         "efforts_env": "GEMINI38_FLASH_REASONING_EFFORTS",
+        "provider": "google",
+        # The pricing catalog lists this model under a longer name.
+        "pricing_model": os.environ.get(
+            "GEMINI38_FLASH_PRICING_MODEL", "gemini-3.8-flash-gt-128k"
+        ),
     },
     "claude-opus-4-8": {
         "upstream": os.environ.get("CLAUDE_OPUS_48_UPSTREAM_MODEL", "claude-opus-4-8"),
         "description": "Anthropic Claude Opus 4.8 via the AI Sandbox",
         "reasoning": "flexible",
         "efforts_env": "CLAUDE_OPUS_48_REASONING_EFFORTS",
+        "provider": "anthropic",
     },
     "claude-fable-5": {
         "upstream": os.environ.get("CLAUDE_FABLE_5_UPSTREAM_MODEL", "claude-fable-5"),
         "description": "Anthropic Claude Fable 5 via the AI Sandbox",
         "reasoning": "flexible",
         "efforts_env": "CLAUDE_FABLE_5_REASONING_EFFORTS",
+        "provider": "anthropic",
     },
 }
 
@@ -469,6 +496,22 @@ def sse_frame(payload: Dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
+def _track_usage(alias: str, usage_data: Any, stream: bool) -> None:
+    """Best-effort usage/cost recording; never breaks the request path."""
+    try:
+        entry = MODEL_REGISTRY.get(alias, {})
+        usage_mod.record(
+            alias,
+            entry.get("upstream", alias),
+            entry.get("provider"),
+            usage_data,
+            stream=stream,
+            pricing_model=entry.get("pricing_model"),
+        )
+    except Exception:  # noqa: BLE001
+        logging.exception("usage tracking failed for model=%s", alias)
+
+
 # --------------------------------------------------------------------------- #
 # Portkey clients (one per API key, cached)
 # --------------------------------------------------------------------------- #
@@ -585,6 +628,7 @@ def _sse_stream(
     first with the tools+reasoning conflict (before any chunk was sent).
     """
     yielded_any = False
+    recorded_usage = False
     try:
         stream = client.chat.completions.create(
             model=upstream, stream=True, **attempts[0]
@@ -593,6 +637,13 @@ def _sse_stream(
             yielded_any = True
             data = to_json_dict(chunk)
             data["model"] = alias  # report the name the client asked for
+            if (
+                not recorded_usage
+                and isinstance(data.get("usage"), dict)
+                and data["usage"]
+            ):
+                recorded_usage = True
+                _track_usage(alias, data["usage"], stream=True)
             yield sse_frame(data)
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
         status, message, err_type, code, param = _exception_details(exc)
@@ -735,6 +786,7 @@ async def chat_completions(request: Request):
             )
         data["model"] = alias
         data.setdefault("object", "chat.completion")
+        _track_usage(alias, data.get("usage"), stream=False)
         return JSONResponse(data)
 
     # Streaming: headers are sent before the request is made, so upstream
@@ -748,6 +800,19 @@ async def chat_completions(request: Request):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ------------------------------- usage report ------------------------------ #
+
+
+@app.get("/v1/usage")
+@app.get("/usage")
+async def get_usage(month: Optional[str] = None):
+    """Monthly usage & cost summary (per model + total vs the budget)."""
+    try:
+        return usage_mod.monthly_report(month)
+    except ValueError as exc:
+        raise ApiError(400, str(exc), param="month")
 
 
 # ------------------------------- models list ------------------------------- #
@@ -792,6 +857,7 @@ async def root():
         "endpoints": {
             "chat_completions": "POST /v1/chat/completions",
             "models": "GET /v1/models",
+            "usage": "GET /v1/usage",
         },
     }
 
@@ -876,6 +942,15 @@ def main() -> None:
     print(f"   Fallback key   : {_masked_key(FALLBACK_API_KEY)}")
     print(f"   Models         : {', '.join(sorted(MODEL_REGISTRY))}")
     print(f"   Streaming usage: {'on' if INCLUDE_STREAM_USAGE else 'off'}")
+    print(
+        "   Usage tracking: "
+        + (
+            f"on -> {usage_mod.USAGE_LOG_PATH} "
+            f"(budget ${usage_mod.MONTHLY_BUDGET_USD:.0f}/mo)"
+            if usage_mod.USAGE_TRACKING
+            else "off"
+        )
+    )
     print(
         "   Gateway timeout: "
         + (

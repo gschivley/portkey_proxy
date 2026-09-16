@@ -17,6 +17,10 @@ proxy (proxy.py) as subprocesses, then verifies:
     but rewrites unsupported values (e.g. "none" -> "low", or via a configured
     vocabulary); gemini-3.8-flash forwards effort values untouched; the
     claude-opus-4-8 / claude-fable-5 aliases use the same flexible profile
+  - usage & cost tracking (usage.py): JSONL records for stream + non-stream
+    calls with costs from the (mocked) pricing API, cached-token split,
+    pricing_model overrides, unknown-price fallback, GET /usage aggregation,
+    and budget-milestone warning logs
 
 Run with the same interpreter that has the dependencies:
     ./.venv/bin/python test_proxy.py
@@ -91,6 +95,8 @@ def main() -> int:
     proxy_log = open(ROOT / "_proxy.log", "w")
     proxy2: subprocess.Popen | None = None
     proxy2_log = None
+    proxy3: subprocess.Popen | None = None
+    proxy3_log = None
 
     mock = subprocess.Popen(
         [PY, str(ROOT / "mock_upstream.py"), "--port", str(mock_port)],
@@ -112,6 +118,10 @@ def main() -> int:
             "CLAUDE_OPUS_48_UPSTREAM_MODEL": "upstream-opus",
             "CLAUDE_FABLE_5_UPSTREAM_MODEL": "upstream-fable",
             "INCLUDE_STREAM_USAGE": "1",
+            # Usage tracking gets its own proxy instance (section 9); keep the
+            # default proxies from writing the repo's usage.jsonl or hitting
+            # the real pricing API.
+            "USAGE_TRACKING": "0",
         }
     )
     proxy = subprocess.Popen(
@@ -673,6 +683,7 @@ def main() -> int:
                 "AI_SANDBOX_KEY": "",
                 "PORTKEY_BASE_URL": f"http://127.0.0.1:{mock_port}",
                 "INCLUDE_STREAM_USAGE": "1",
+                "USAGE_TRACKING": "0",
                 "TOOLS_REASONING_EFFORT": "none",
                 "PORTKEY_TIMEOUT_MS": "300000",
                 # Vocabulary override: the proxy must honour configured values
@@ -785,10 +796,237 @@ def main() -> int:
             str(cap["body"].get("reasoning_effort")),
         )
 
+        # 9. Usage & cost tracking (dedicated proxy, isolated log/cache) ---
+        usage_log = ROOT / "_usage_test.jsonl"
+        pricing_cache = ROOT / "_pricing_cache_test.json"
+        for stale in (usage_log, pricing_cache, ROOT / "_proxy3.log"):
+            if stale.exists():
+                stale.unlink()
+        month_now = time.strftime("%Y-%m")
+        seed = {
+            "ts": f"{month_now}-01T00:00:00",
+            "month": month_now,
+            "model": "seed-model",
+            "upstream": "seed-upstream",
+            "provider": "openai",
+            "pricing_model": "seed-upstream",
+            "stream": False,
+            "prompt_tokens": 100,
+            "cached_tokens": 0,
+            "completion_tokens": 50,
+            "reasoning_tokens": 0,
+            "total_tokens": 150,
+            "rates": {"input": 0.0004, "output": 0.002},
+            "cost_usd": 49.9999,
+        }
+        usage_log.write_text(json.dumps(seed) + "\n", encoding="utf-8")
+
+        env3 = dict(env)
+        env3.update(
+            {
+                "USAGE_TRACKING": "1",
+                "USAGE_LOG_PATH": str(usage_log),
+                "PRICING_CACHE_PATH": str(pricing_cache),
+                "PRICING_BASE_URL": f"http://127.0.0.1:{mock_port}",
+            }
+        )
+        proxy3_port = free_port()
+        proxy3_log = open(ROOT / "_proxy3.log", "w")
+        proxy3 = subprocess.Popen(
+            [PY, str(ROOT / "proxy.py"), "--port", str(proxy3_port)],
+            stdout=proxy3_log,
+            stderr=subprocess.STDOUT,
+            cwd=ROOT,
+            env=env3,
+        )
+        base3 = f"http://127.0.0.1:{proxy3_port}"
+        check("usage: tracking proxy starts", wait_ready(f"{base3}/health"))
+        client3 = httpx.Client(base_url=base3, timeout=30.0)
+
+        def usage_records() -> list[dict]:
+            return [
+                json.loads(line)
+                for line in usage_log.read_text().splitlines()
+                if line.strip()
+            ]
+
+        # Non-streaming: token counts + cost from mock pricing (cached split).
+        mock_in = (8 * 0.0004 + 4 * 0.00004 + 8 * 0.002) / 100
+        r = client3.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-5.6-sol",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "mock_cached_tokens": 4,
+            },
+        )
+        check("usage: non-stream request ok", r.status_code == 200, r.text)
+        sol = [x for x in usage_records() if x["model"] == "gpt-5.6-sol"]
+        check("usage: one non-stream record", len(sol) == 1, str(len(sol)))
+        if sol:
+            s = sol[0]
+            check(
+                "usage: record identifies model/provider",
+                s["upstream"] == "upstream-sol"
+                and s["provider"] == "openai"
+                and s["stream"] is False,
+                str(s),
+            )
+            check(
+                "usage: token counts incl. cached",
+                s["prompt_tokens"] == 12
+                and s["cached_tokens"] == 4
+                and s["completion_tokens"] == 8,
+                str(s),
+            )
+            check(
+                "usage: cost computed from pricing API rates",
+                s["cost_usd"] is not None and abs(s["cost_usd"] - mock_in) < 1e-9,
+                str(s.get("cost_usd")),
+            )
+            check(
+                "usage: applied rates stored on record",
+                bool(s.get("rates")) and s["rates"]["input"] == 0.0004,
+                str(s.get("rates")),
+            )
+
+        # Streaming: usage captured from the final SSE chunk.
+        mock_nosplit = (12 * 0.0004 + 8 * 0.002) / 100
+        r = client3.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-5.6-terra",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+            },
+        )
+        check("usage: stream request ok", r.status_code == 200, r.text)
+        terr = [x for x in usage_records() if x["model"] == "gpt-5.6-terra"]
+        check(
+            "usage: stream record from final usage chunk",
+            len(terr) == 1
+            and terr[0]["stream"] is True
+            and terr[0]["cost_usd"] is not None
+            and abs(terr[0]["cost_usd"] - mock_nosplit) < 1e-9,
+            str(terr),
+        )
+
+        # Unknown pricing: request succeeds, cost stored as null.
+        r = client3.post(
+            "/v1/chat/completions",
+            json={"model": "claude-fable-5", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+        check("usage: unpriced model request ok", r.status_code == 200, r.text)
+        fab = [x for x in usage_records() if x["model"] == "claude-fable-5"]
+        check(
+            "usage: unpriced model recorded with cost null",
+            len(fab) == 1 and fab[0]["cost_usd"] is None,
+            str(fab),
+        )
+
+        # gemini is priced under its catalog name (pricing_model override).
+        r = client3.post(
+            "/v1/chat/completions",
+            json={"model": "gemini-3.8-flash", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+        check("usage: gemini request ok", r.status_code == 200, r.text)
+        gem = [x for x in usage_records() if x["model"] == "gemini-3.8-flash"]
+        mock_gem = (12 * 0.000075 + 8 * 0.000375) / 100
+        check(
+            "usage: gemini priced under gt-128k catalog name",
+            len(gem) == 1
+            and gem[0]["pricing_model"] == "gemini-3.8-flash-gt-128k"
+            and gem[0]["cost_usd"] is not None
+            and abs(gem[0]["cost_usd"] - mock_gem) < 1e-9,
+            str(gem),
+        )
+
+        # GET /v1/usage and /usage aggregation (seed + 4 tracked requests).
+        spent = 49.9999 + mock_in + mock_nosplit + mock_gem
+        r = client3.get("/v1/usage")
+        rep = r.json() if r.status_code == 200 else {}
+        check("usage: GET /v1/usage -> 200", r.status_code == 200, r.text)
+        check(
+            "usage: month, request count and spend",
+            rep.get("month") == month_now
+            and rep.get("requests") == 5
+            and abs(rep.get("spent_usd", 0) - spent) < 1e-6,
+            str(rep),
+        )
+        check(
+            "usage: budget/remaining math",
+            rep.get("budget_usd") == 250.0
+            and abs(rep.get("remaining_usd", 0) - (250.0 - spent)) < 1e-6
+            and rep.get("over_budget") is False,
+            str(rep),
+        )
+        check(
+            "usage: per-model rows",
+            {m["model"] for m in rep.get("models", [])}
+            == {
+                "seed-model",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "claude-fable-5",
+                "gemini-3.8-flash",
+            },
+            str(rep.get("models")),
+        )
+        check(
+            "usage: unpriced requests counted",
+            rep.get("requests_without_pricing") == 1,
+            str(rep.get("requests_without_pricing")),
+        )
+        r = client3.get("/usage")
+        check(
+            "usage: bare /usage aggregates the same",
+            r.status_code == 200 and r.json().get("requests") == 5,
+            r.text,
+        )
+        r = client3.get("/v1/usage", params={"month": "2020-01"})
+        check(
+            "usage: other month is empty",
+            r.status_code == 200 and r.json().get("requests") == 0,
+            r.text,
+        )
+        r = client3.get("/v1/usage", params={"month": "nope"})
+        check(
+            "usage: invalid month -> 400",
+            r.status_code == 400 and r.json()["error"].get("param") == "month",
+            r.text,
+        )
+
+        # Budget milestone warning (seed spend 49.99 crossed $50.00).
+        p3log = (ROOT / "_proxy3.log").read_text(encoding="utf-8", errors="replace")
+        check(
+            "usage: $50 crossing warning logged",
+            "crossed $50.00" in p3log,
+            p3log[-300:],
+        )
+        check(
+            "usage: missing-pricing warning logged",
+            "no pricing for anthropic/upstream-fable" in p3log,
+            p3log[-300:],
+        )
+
+        # Pricing cache persisted on disk, incl. the negative anthropic entry.
+        try:
+            cache = json.loads(pricing_cache.read_text(encoding="utf-8"))
+        except OSError:
+            cache = {}
+        check(
+            "usage: pricing cache populated (incl. negative)",
+            "openai/upstream-sol" in cache
+            and (cache.get("anthropic/upstream-fable") or {}).get("rates") == {},
+            str(sorted(cache)),
+        )
+
     finally:
         procs = [(proxy, proxy_log), (mock, mock_log)]
         if proxy2 is not None:
             procs.append((proxy2, proxy2_log))
+        if proxy3 is not None:
+            procs.append((proxy3, proxy3_log))
         for proc, _ in procs:
             proc.terminate()
         for proc, log in procs:
@@ -799,6 +1037,9 @@ def main() -> int:
             log.close()
         if CAPTURE.exists():
             CAPTURE.unlink()
+        for leftover in (ROOT / "_usage_test.jsonl", ROOT / "_pricing_cache_test.json"):
+            if leftover.exists():
+                leftover.unlink()
 
     print()
     print(f"  {len(PASSED)} passed, {len(FAILED)} failed")

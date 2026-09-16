@@ -29,6 +29,7 @@ deployment name on the sandbox, map it to a real model by setting the matching
 
 - `POST /v1/chat/completions` (also mounted at `/chat/completions`) — OpenAI chat completions, streaming (`"stream": true`) and non-streaming.
 - `GET /v1/models` (also at `/models`) — lists the available models.
+- `GET /v1/usage` (also at `/usage`) — monthly usage & cost report (`?month=YYYY-MM`).
 - `GET /health`, `GET /` — liveness info.
 - `POST /v1/responses` — returns a 404 with a clear message (the Sandbox does not support the Responses API).
 
@@ -117,6 +118,46 @@ curl -N http://127.0.0.1:8090/v1/chat/completions \
   -d '{"model":"gpt-5.6-terra","stream":true,"messages":[{"role":"user","content":"Say hi"}]}'
 ```
 
+## Usage tracking & budget
+
+The AI Sandbox caps each user at **$250/month**, but Portkey offers no spend
+report — so the proxy keeps its own. On every completed request (streaming or
+not) it reads the response's `usage` block, computes the dollar cost from
+Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
+
+```json
+{"ts":"2026-09-16T09:51:02","month":"2026-09","model":"gpt-5.6-sol","upstream":"gpt-5.6-sol",
+ "provider":"openai","pricing_model":"gpt-5.6-sol","stream":true,"prompt_tokens":12,
+ "cached_tokens":4,"completion_tokens":8,"reasoning_tokens":0,"total_tokens":20,
+ "rates":{"input":0.0004,"output":0.002,"cache_read_input":4e-05},"cost_usd":0.000198}
+```
+
+- **Prices** come from `https://api.portkey.ai/model-configs/pricing/<provider>/<model>`
+  (public, no key) and are cached in `.pricing_cache.json` for 24 h. The API's
+  numbers are the per-token USD price x100, so
+  `cost_usd = tokens x price / 100`. Each record stores the rates applied, so
+  history is auditable and never rewritten when prices change. Models with no
+  catalog entry (the Sandbox deployment names differ, e.g. `gemini-3.8-flash`
+  is priced as `gemini-3.8-flash-gt-128k`) are recorded with `cost_usd: null`
+  and flagged in reports — requests are never blocked over tracking issues.
+- **Budget warnings** are logged by the proxy when the running monthly total
+  crosses $50 / $100 / $150 / $200 / $250, and when $25 or $10 remain.
+  Tracking is observe-only: the proxy never rejects a request for budget.
+- **Reports:**
+
+```bash
+curl -s http://127.0.0.1:8090/v1/usage              # current month (JSON)
+curl -s "http://127.0.0.1:8090/v1/usage?month=2026-08"
+
+./.venv/bin/python usage_report.py                  # pretty table, current month
+./.venv/bin/python usage_report.py --month 2026-08  # ... or any past month
+./.venv/bin/python usage_report.py --json           # raw report
+```
+
+`usage_report.py` reads `usage.jsonl` directly, so it works even while the
+proxy is stopped. The log is append-only and gitignored — delete or rotate it
+freely (a month's totals are always recomputed from the records present).
+
 ## Tests
 
 Runs the proxy against a mock upstream (no real key needed):
@@ -203,3 +244,10 @@ the banner (`Gateway timeout: ...`) or the started log to confirm.
 | `GPT56_SOL_UPSTREAM_MODEL` / `GPT56_TERRA_UPSTREAM_MODEL` / `GPT56_LUNA_UPSTREAM_MODEL` / `GPT6_ASTRA_UPSTREAM_MODEL` / `GEMINI38_FLASH_UPSTREAM_MODEL` | alias name | Map an alias to a different upstream model |
 | `GPT6_ASTRA_REASONING_EFFORTS` | `low,medium,high,xhigh` | Comma-separated `reasoning_effort` values the upstream accepts for `gpt-6-astra`; unsupported client values are rewritten to the first non-`none` entry |
 | `GEMINI38_FLASH_REASONING_EFFORTS` | – (unset) | Optional comma-separated `reasoning_effort` list for `gemini-3.8-flash`; when unset, client values are forwarded untouched |
+| `USAGE_TRACKING` | `1` | Record token usage and dollar cost of every request to the JSONL usage log |
+| `USAGE_LOG_PATH` | `usage.jsonl` (next to `proxy.py`) | Append-only usage log; also read directly by `usage_report.py` |
+| `MONTHLY_BUDGET_USD` | `250` | Monthly budget used by `/v1/usage` reports and the proxy's budget warning logs |
+| `PRICING_BASE_URL` | `https://api.portkey.ai/model-configs` | Pricing API base; the proxy fetches `/pricing/<provider>/<model>` (public, no key) |
+| `PRICING_CACHE_PATH` | `.pricing_cache.json` | Cached pricing responses (refreshed after the TTL; stale cache is used if a refresh fails) |
+| `PRICING_TTL_HOURS` | `24` | How long a cached price is considered fresh |
+| `GEMINI38_FLASH_PRICING_MODEL` | `gemini-3.8-flash-gt-128k` | Pricing-catalog name used for `gemini-3.8-flash` (it is not listed under its request name) |

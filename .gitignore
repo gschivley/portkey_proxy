@@ -8,3 +8,8 @@ _mock.log
 _proxy.log
 _proxy2.log
 _live_test.log
+usage.jsonl
+.pricing_cache.json
+_proxy3.log
+_usage_test.jsonl
+_pricing_cache_test.json

@@ -19,7 +19,7 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the full integration test suite (84 checks; boots a mock upstream + the real proxy)
+# Run the full integration test suite (108 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -32,12 +32,24 @@ pip install -r requirements.txt
 
 - `proxy.py` — everything: `.env` loading, model registry, reasoning handling,
   Portkey client cache, FastAPI app, error translation, `main()`.
+- `usage.py` — usage & cost tracking (imported by `proxy.py` and `usage_report.py`).
+  Reads its config at import time (after `.env` loading). `PricingCache` fetches
+  `GET {PRICING_BASE_URL}/pricing/<provider>/<model>` (public Portkey API) with a
+  file-backed TTL cache and negative caching; `record()` appends one JSONL line per
+  call to `usage.jsonl` and emits budget-milestone warnings; `monthly_report()`
+  aggregates by model for a `YYYY-MM` bucket. Cost formula:
+  `tokens * price / 100` — the API returns the per-token USD price scaled x100.
+- `usage_report.py` — CLI over the same JSONL log (works while the proxy is stopped).
 - `mock_upstream.py` — mock OpenAI-compatible upstream used by the tests. Records
   every request to `_captured.json` and supports test-only "personality" modes via
-  a `mock_upstream_mode` body field (popped before forwarding).
+  a `mock_upstream_mode` body field (popped before forwarding). Also serves
+  `GET /pricing/<provider>/<model>` (fixed `openai`/`google` rates; `anthropic`
+  404s to exercise the no-pricing path) and honors a `mock_cached_tokens` field to
+  report cached input tokens in `usage`.
 - `test_proxy.py` — end-to-end integration test: starts `mock_upstream.py` and
   `proxy.py` as subprocesses on free ports, drives them with `httpx`, asserts with
-  `check()`.
+  `check()`. Section 9 boots a dedicated tracking proxy with `USAGE_TRACKING=1`
+  pointed at isolated `_usage_test.jsonl` / `_pricing_cache_test.json` files.
 - `portkey_text_example.py` / `faqs.txt` — reference material from Princeton
   (official SDK example and AI Sandbox FAQ); not part of the proxy.
 
@@ -64,7 +76,10 @@ pip install -r requirements.txt
 - **Model aliases vs upstream models**: `MODEL_REGISTRY` maps the names Copilot
   requests (e.g. `gpt-5.6-sol`) to upstream deployment names. Each alias can be
   overridden with `*_UPSTREAM_MODEL` env vars. Add new models to `MODEL_REGISTRY`
-  (and the README table).
+  (and the README table). Each entry also declares a `provider` (`openai`/
+  `anthropic`/`google`) used for the pricing lookup; if the deployment's pricing
+  name differs from its `upstream`, set a `pricing_model` (e.g. `gemini-3.8-flash`
+  → `gemini-3.8-flash-gt-128k`).
 - **Reasoning is per-model, not global**: `REASONING_PROFILES` captures three
   upstream quirks:
   - `gpt-5.6` — upstream rejects function `tools` + reasoning together.
@@ -112,4 +127,4 @@ pip install -r requirements.txt
   actually forwarded; it's gitignored and deleted at the end of the run.
 - Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log` (gitignored).
 - After changing proxy behavior, run `./.venv/bin/python test_proxy.py` and
-  confirm "ALL TESTS PASSED" (84 checks).
+  confirm "ALL TESTS PASSED" (108 checks).

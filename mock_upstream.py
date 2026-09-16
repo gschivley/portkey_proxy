@@ -50,6 +50,32 @@ UNSUPPORTED_EFFORT_ERROR = (
     "Supported values are: 'low', 'medium', 'high', and 'xhigh'."
 )
 
+# Fixed pricing served at /pricing/<provider>/<model> for usage-tracking
+# tests (Portkey pricing-API shape; anthropic is intentionally absent so the
+# "model has no known price" path can be exercised).
+MOCK_PRICING: Dict[str, Dict[str, float]] = {
+    "openai": {
+        "request_token": 0.0004,
+        "response_token": 0.002,
+        "cache_read_input_token": 0.00004,
+        "cache_write_input_token": 0.0005,
+    },
+    "google": {
+        "request_token": 0.000075,
+        "response_token": 0.000375,
+        "cache_read_input_token": 0.0000075,
+    },
+}
+
+
+@app.get("/pricing/{provider}/{model}")
+async def pricing(provider: str, model: str):
+    rates = MOCK_PRICING.get(provider)
+    if not rates:
+        return _error(404, "Pricing config not found for the given model")
+    payg = {k: {"price": v} for k, v in rates.items()}
+    return {"pay_as_you_go": payg, "currency": "USD"}
+
 
 def _error(
     status: int, message: str, param: Any = None, code: Any = None
@@ -90,6 +116,8 @@ async def chat_completions(request: Request):
     body = await request.json()
     # Test-only directive selecting the upstream's validation personality.
     mode = body.pop("mock_upstream_mode", None)
+    # Test-only directive: report this many cached input tokens in usage.
+    cached_tokens = body.pop("mock_cached_tokens", None)
     _record(request, body)
     model = body.get("model", "unknown")
     now = int(time.time())
@@ -133,6 +161,14 @@ async def chat_completions(request: Request):
             },
         )
 
+    usage: Dict[str, Any] = {
+        "prompt_tokens": 12,
+        "completion_tokens": 8,
+        "total_tokens": 20,
+    }
+    if cached_tokens is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+
     if not body.get("stream"):
         return {
             "id": "cmpl-mock-0001",
@@ -146,7 +182,7 @@ async def chat_completions(request: Request):
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+            "usage": usage,
         }
 
     def stream():
@@ -177,17 +213,7 @@ async def chat_completions(request: Request):
             }
         )
         if (body.get("stream_options") or {}).get("include_usage"):
-            yield _sse(
-                {
-                    **base,
-                    "choices": [],
-                    "usage": {
-                        "prompt_tokens": 12,
-                        "completion_tokens": 8,
-                        "total_tokens": 20,
-                    },
-                }
-            )
+            yield _sse({**base, "choices": [], "usage": usage})
         yield _sse(
             {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
         )
