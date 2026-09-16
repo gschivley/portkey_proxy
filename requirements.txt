@@ -1,0 +1,5 @@
+portkey-ai>=2.3.4
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-dotenv>=1.0
+httpx>=0.27

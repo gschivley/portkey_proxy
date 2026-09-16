@@ -1,0 +1,69 @@
+AI Sandbox FAQ
+Article metadata.This article was updated  2mo ago2 months ago This article has 343 views. •  343 Views
+Who can access the AI Sandbox?
+The AI Sandbox is available to Princeton faculty conducting academic research. Faculty members may request access for themselves or others they supervise using the AI Sandbox Access Request Form. 
+How do I get access to the AI Sandbox?
+Access to the AI Sandbox is granted through an approval process. It typically takes up to two (2) business days from the request to have your account set up and ready.
+What do I need to use the AI Sandbox programmatically?
+You will be issued an API key to access the AI Sandbox programmatically. Once you have the key, you can run your code from anywhere with the appropriate credentials.  Here are examples for using Python to use the API:  portkey_text_example.py and portkey_image_example.py
+What is "Portkey"?
+Portkey is the AI API Gateway service that we use to route your prompt to the appropriate LLM.  Portkey allows us to manage user access, track token costs associated with each user and limit monthly costs.  Unfortunately each user cannot request a report of their monthly spend, however we understand that Portkey is planning to provide this functionality in future versions.
+Can I use AI Sandbox with Claude Code?
+Yes.  You can configure the Claude Code application to connect to AI Sandbox for access to LLM’s.  See the Portkey Information on Claude Code Integration.  The following is an example entry for the ~/.claude/settings.json file:
+{ 
+   
+	"theme": "light", 
+   
+
+"env": {"ANTHROPIC_BASE_URL": "https://api.portkey.ai", 
+    "ANTHROPIC_AUTH_TOKEN": "<MY PORTKEY API KEY>", 
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6", 
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7", 
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5" 
+  }, 
+
+"model": "claude-sonnet-4-6" 
+ 
+
+} 
+What models are available in the AI Sandbox?
+The models available in the AI Sandbox change over time. For the most up-to-date information on available models, please refer to the AI Sandbox KB article: AI Sandbox Overview.
+What API methods are supported in the AI Sandbox?
+The AI Sandbox currently supports the openai.ChatCompletion.create method, which is part of the earlier OpenAI SDK approach. The Responses API from the newer SDK is not yet supported and attempts to use this may result in a 404 error.
+Can I send multiple API calls at the same time in the AI Sandbox?
+Yes, you can send simultaneous API calls using parallel processing methods such as Python multiprocessing. However, be mindful of rate limits and potential costs associated with high-volume requests. Rates are listed please in the AI Sandbox KB article: AI Sandbox Overview.
+Is there a cost to using the AI Sandbox?
+The AI Sandbox is available with a $250/month budget cap per user. If your usage exceeds this limit, access to the Sandbox will be temporarily restricted until the following month, when the budget resets.
+How do I manage costs when using the AI Sandbox? The AI Sandbox has a $250/month budget cap per user. If your usage exceeds this limit, access to the Sandbox will be temporarily restricted until the following month. If you anticipate needing to exceed this cap, please provide OIT with a project chart string for billing the additional charges. This ensures that costs are appropriately tracked and billed.
+What should I do if my AI Sandbox request is blocked by content safety filtering?
+If content filtering interferes with your work, please review your prompt to ensure it doesn’t trigger the safety filters. If the issue persists, contact the AI Sandbox support team for guidance on adjusting your prompt or exploring alternative solutions. Content filtering is enabled to ensure responsible use of the platform.
+Is it possible to disable content filtering in the AI Sandbox?
+Currently, content filtering cannot be disabled in the AI Sandbox, as it is in place to prevent harmful content and ensure compliance with university policies. This decision follows guidance from the Dean for Research, and we are not able to remove or bypass these filters at this time.
+How do I report an error in the AI Sandbox?
+If you encounter errors, such as content filtering issues or technical glitches, please reach out to the AI Sandbox support team with details of the error message, model used, and the task performed.
+Can the AI Sandbox support research outside of faculty work?
+The AI Sandbox is currently designed to support faculty research and students sponsored by faculty. 
+Can I collaborate with other Princeton researches on a project using the AI Sandbox?
+Yes, the AI Sandbox allows faculty members to collaborate on research projects, but each individual will need to have their own access credentials. You can work with your team members and share resources accordingly.
+Can I access the AI Sandbox from a computing node?
+Yes, you can access the AI Sandbox from computing nodes. Once you have been granted access and issued API keys, you can run your code remotely, including from computing nodes within Princeton's network. Additional details - A.I. Sandbox | Princeton Research Computing
+What should I do if I need to scale my API usage or use a larger model?
+If your project requires more resources or if you anticipate exceeding the cap, please contact us with your project chart string for billing the difference. We’ll discuss potential solutions to accommodate your needs within budget constraints.
+Does the AI Sandbox support any AI agent toolboxes, like LangChain or Semantic Kernel?
+The AI Sandbox is primarily designed to support LLM's for general-purpose research. Advanced frameworks such as LangChain and Semantic Kernel are not currently integrated into the system but may be available through other means. Please contact the AI support team if you need assistance with specific toolboxes.
+What happens when a model retires?
+When a model retires, it will no longer be available for use in the AI Sandbox. We periodically update the AI Sandbox article to reflect the status of models, including any retirements, new model availability, and associated costs. Please check the article regularly for the latest information.
+
+How can I optimize performance when using the AI Sandbox?
+To ensure optimal performance when using the AI Sandbox, it’s important to consider factors like model selection, input size, and request frequency. For example, using smaller models or adjusting the temperature and max tokens settings can help reduce response time and resource consumption. Additionally, breaking down large tasks into smaller, more manageable chunks can improve processing efficiency.
+How do I see the token usage?
+To keep track of the token usage, you can append the following code snippet at the end of each prompt submitted in your code.
+    print("\n" + response.choices[0].message.content)
+        if response.usage:
+        print(f"\nPrompt Tokens Used: {response.usage.prompt_tokens}")
+        print(f"Completion Tokens Used: {response.usage.completion_tokens}")
+        print(f"Total Tokens Used: {response.usage.total_tokens}")
+How do ports and proxy settings work when running AI Sandbox jobs on Princeton systems?
+AI Sandbox runs in the cloud but can also be accessed from on-prem research clusters. Network access, including open ports and proxy requirements, may differ between environments. See the Ports and Proxy Configuration Guide for details on default settings and how to request additional access.
+How can I learn more about AI and machine learning?
+Check out our curated list of recommended courses and tutorials on the Research Computing A.I. and Machine Learning resources page.
