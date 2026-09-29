@@ -14,6 +14,7 @@ Exposed models (by default):
 | `gpt-5.6-terra`               | `gpt-5.6-terra`|
 | `gpt-5.6-luna`                | `gpt-5.6-luna` |
 | `gpt-6-astra`                 | `gpt-6-astra`  |
+| `gpt-6.1-sol`                 | `gpt-6.1-sol`  |
 | `gemini-3.8-flash`            | `gemini-3.8-flash` |
 | `claude-opus-4-8`             | `claude-opus-4-8` |
 | `claude-fable-5`              | `claude-fable-5` |
@@ -21,7 +22,7 @@ Exposed models (by default):
 The aliases are passed through to Portkey as-is. If an alias is not a real
 deployment name on the sandbox, map it to a real model by setting the matching
 `*_UPSTREAM_MODEL` variable (e.g. `GPT56_SOL_UPSTREAM_MODEL`,
-`GPT6_ASTRA_UPSTREAM_MODEL`, `GEMINI38_FLASH_UPSTREAM_MODEL`,
+`GPT6_ASTRA_UPSTREAM_MODEL`, `GPT6_SOL_UPSTREAM_MODEL`, `GEMINI38_FLASH_UPSTREAM_MODEL`,
 `CLAUDE_OPUS_48_UPSTREAM_MODEL`, `CLAUDE_FABLE_5_UPSTREAM_MODEL`; or editing
 `MODEL_REGISTRY` in `proxy.py`) — e.g. `claude-sonnet-4-6`.
 
@@ -175,7 +176,7 @@ disagree about it. Each model in `MODEL_REGISTRY` declares a profile from
 | Profile | Models | Behaviour |
 | --------- | -------- | ----------- |
 | `gpt-5.6` | `gpt-5.6-sol/terra/luna` | Rejects function `tools` + reasoning together. The proxy strips reasoning when tools are present, and auto-retries with `reasoning_effort: "none"` if the upstream still complains. `"none"` **is** a valid value here. |
-| `gpt-6` | `gpt-6-astra` | Accepts tools + reasoning, but `"none"` is **not** a valid effort — supported values are `low`, `medium`, `high`, `xhigh`. The proxy leaves reasoning intact and rewrites any unsupported value (e.g. a client-sent `"none"`) to the fallback `low`. |
+| `gpt-6` | `gpt-6-astra`, `gpt-6.1-sol` | Accepts tools + reasoning, but `"none"` is **not** a valid effort — supported values are `low`, `medium`, `high`, `xhigh`. The proxy leaves reasoning intact and rewrites any unsupported value (e.g. a client-sent `"none"`) to the fallback `low`. |
 | `flexible` | `gemini-3.8-flash` | Accepts tools + reasoning and its own effort vocabulary, so values are forwarded untouched unless you configure an explicit list. |
 
 **"Function tools with reasoning_effort are not supported ... set reasoning_effort to 'none'"**
@@ -241,7 +242,7 @@ the banner (`Gateway timeout: ...`) or the started log to confirm.
 | `PORTKEY_TIMEOUT_MS` | – (unset) | Per-request upstream timeout sent to the Portkey gateway, in **milliseconds**. Leave unset so the gateway default applies. Do NOT use seconds (e.g. `600` = 600 ms) — that caused `408 Request exceeded the timeout` |
 | `INCLUDE_STREAM_USAGE` | `1` | Send `stream_options.include_usage` to get token usage in streaming |
 | `TOOLS_REASONING_EFFORT` | `strip` | For models that reject tools + reasoning (GPT-5.6 only): `strip`, `none`, or `keep` (the alternative is auto-tried on the upstream's tools+reasoning 400) |
-| `GPT56_SOL_UPSTREAM_MODEL` / `GPT56_TERRA_UPSTREAM_MODEL` / `GPT56_LUNA_UPSTREAM_MODEL` / `GPT6_ASTRA_UPSTREAM_MODEL` / `GEMINI38_FLASH_UPSTREAM_MODEL` | alias name | Map an alias to a different upstream model |
+| `GPT56_SOL_UPSTREAM_MODEL` / `GPT56_TERRA_UPSTREAM_MODEL` / `GPT56_LUNA_UPSTREAM_MODEL` / `GPT6_ASTRA_UPSTREAM_MODEL` / `GPT6_SOL_UPSTREAM_MODEL` / `GEMINI38_FLASH_UPSTREAM_MODEL` | alias name | Map an alias to a different upstream model |
 | `GPT6_ASTRA_REASONING_EFFORTS` | `low,medium,high,xhigh` | Comma-separated `reasoning_effort` values the upstream accepts for `gpt-6-astra`; unsupported client values are rewritten to the first non-`none` entry |
 | `GEMINI38_FLASH_REASONING_EFFORTS` | – (unset) | Optional comma-separated `reasoning_effort` list for `gemini-3.8-flash`; when unset, client values are forwarded untouched |
 | `USAGE_TRACKING` | `1` | Record token usage and dollar cost of every request to the JSONL usage log |

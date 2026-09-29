@@ -38,6 +38,7 @@ Configuration (local .env file next to this script, or environment):
     GPT56_TERRA_UPSTREAM_MODEL   optional upstream model for gpt-5.6-terra
     GPT56_LUNA_UPSTREAM_MODEL   optional upstream model for gpt-5.6-luna
     GPT6_ASTRA_UPSTREAM_MODEL    optional upstream model for gpt-6-astra
+    GPT6_SOL_UPSTREAM_MODEL      optional upstream model for gpt-6.1-sol
     GEMINI38_FLASH_UPSTREAM_MODEL  optional upstream model for gemini-3.8-flash
     CLAUDE_OPUS_48_UPSTREAM_MODEL  optional upstream model for claude-opus-4-8
     CLAUDE_FABLE_5_UPSTREAM_MODEL  optional upstream model for claude-fable-5
@@ -218,6 +219,13 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     },
     "gpt-6-astra": {
         "upstream": os.environ.get("GPT6_ASTRA_UPSTREAM_MODEL", "gpt-6-astra"),
+        "description": "Portkey/AI Sandbox model exposed to the Copilot app",
+        "reasoning": "gpt-6",
+        "efforts_env": "GPT6_ASTRA_REASONING_EFFORTS",
+        "provider": "openai",
+    },
+    "gpt-6.1-sol": {
+        "upstream": os.environ.get("GPT6_SOL_UPSTREAM_MODEL", "gpt-6.1-sol"),
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-6",
         "efforts_env": "GPT6_ASTRA_REASONING_EFFORTS",

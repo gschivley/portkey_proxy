@@ -151,6 +151,7 @@ def main() -> int:
             and "gpt-5.6-terra" in ids
             and "gpt-5.6-luna" in ids
             and "gpt-6-astra" in ids
+            and "gpt-6.1-sol" in ids
             and "gemini-3.8-flash" in ids
             and "claude-opus-4-8" in ids
             and "claude-fable-5" in ids,
@@ -914,7 +915,10 @@ def main() -> int:
         # Unknown pricing: request succeeds, cost stored as null.
         r = client3.post(
             "/v1/chat/completions",
-            json={"model": "claude-fable-5", "messages": [{"role": "user", "content": "Hi"}]},
+            json={
+                "model": "claude-fable-5",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
         )
         check("usage: unpriced model request ok", r.status_code == 200, r.text)
         fab = [x for x in usage_records() if x["model"] == "claude-fable-5"]
@@ -927,7 +931,10 @@ def main() -> int:
         # gemini is priced under its catalog name (pricing_model override).
         r = client3.post(
             "/v1/chat/completions",
-            json={"model": "gemini-3.8-flash", "messages": [{"role": "user", "content": "Hi"}]},
+            json={
+                "model": "gemini-3.8-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
         )
         check("usage: gemini request ok", r.status_code == 200, r.text)
         gem = [x for x in usage_records() if x["model"] == "gemini-3.8-flash"]
