@@ -3,9 +3,10 @@
 Usage & cost tracking for the Portkey proxy (used by proxy.py and
 usage_report.py).
 
-Every completed chat request is appended as one JSON line to a usage log
-(default: usage.jsonl next to this script) with its token counts and the
-dollar cost computed from Portkey's public model-pricing API:
+Every completed request (chat completions or Responses API) is appended as one
+JSON line to a usage log (default: usage.jsonl next to this script) with its
+token counts and the dollar cost computed from Portkey's public
+model-pricing API:
 
     GET {PRICING_BASE_URL}/pricing/<provider>/<model>
     (default PRICING_BASE_URL = https://api.portkey.ai/model-configs)
@@ -195,14 +196,30 @@ def _to_int(value: Any) -> int:
 
 
 def extract_tokens(usage: Dict[str, Any]) -> Dict[str, int]:
-    """Normalize an OpenAI usage object into the token counts we track."""
-    prompt = _to_int(usage.get("prompt_tokens"))
+    """Normalize an OpenAI usage object into the token counts we track.
+
+    Accepts both wire formats and emits one canonical schema, so reports and
+    cost math stay format-agnostic:
+      - chat completions: prompt_tokens / completion_tokens and their
+        *_tokens_details objects
+      - Responses API:    input_tokens / output_tokens and their
+        *_tokens_details objects
+    Chat-style keys win if a payload somehow carries both.
+    """
     details = usage.get("prompt_tokens_details")
+    if not isinstance(details, dict):
+        details = usage.get("input_tokens_details")
+    cdetails = usage.get("completion_tokens_details")
+    if not isinstance(cdetails, dict):
+        cdetails = usage.get("output_tokens_details")
+
+    prompt = _to_int(usage.get("prompt_tokens")) or _to_int(usage.get("input_tokens"))
     cached = _to_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
     cached = min(cached, prompt)
-    completion = _to_int(usage.get("completion_tokens"))
+    completion = _to_int(usage.get("completion_tokens")) or _to_int(
+        usage.get("output_tokens")
+    )
     total = _to_int(usage.get("total_tokens")) or (prompt + completion)
-    cdetails = usage.get("completion_tokens_details")
     reasoning = (
         _to_int(cdetails.get("reasoning_tokens")) if isinstance(cdetails, dict) else 0
     )

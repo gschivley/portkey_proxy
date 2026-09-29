@@ -4,6 +4,7 @@ Portkey AI Sandbox -> local OpenAI-compatible HTTP proxy for GitHub Copilot.
 
 Exposes:
     POST /v1/chat/completions     (also /chat/completions)
+    POST /v1/responses            (also /responses; OpenAI Responses API)
     GET  /v1/models               (also /models)
     GET  /v1/usage                (also /usage; monthly cost/usage report)
     GET  /health, GET /
@@ -12,6 +13,15 @@ Incoming OpenAI-compatible requests are translated into calls to the
 `portkey_ai` Python SDK; SDK responses (including streaming SSE) are
 converted back into OpenAI JSON/SSE. Model names, parameters, errors and
 usage metadata are preserved.
+
+Both wire APIs are served and the client chooses; a chat response is never
+handed back as a `response` object (the shapes are not interchangeable). The
+one deliberate exception is transparent: a chat request carrying function tools
+can be *served* through the Responses API and translated back into
+chat-completion shape — see TOOLS_VIA_RESPONSES. That matters because the
+GPT-5.6 family rejects tools + reasoning on /v1/chat/completions (adjusted via
+TOOLS_REASONING_EFFORT) and the gpt-6 family rejects tools there in every
+shape, while both accept them on /v1/responses.
 
 Authentication: the API key configured in the Copilot app's model provider
 settings is used. The app sends it on every request as
@@ -30,10 +40,30 @@ Configuration (local .env file next to this script, or environment):
                            milliseconds (unset: gateway default applies;
                            never put seconds here — 600 means 600 ms)
     INCLUDE_STREAM_USAGE   "1" to request usage in streaming responses (default)
+    RESPONSES_ENABLED      "0" to disable POST /v1/responses (default on; when
+                           off the route answers the original 404 stub)
     TOOLS_REASONING_EFFORT strip|none|keep for requests with function tools
                            (default strip; only applied to models whose
                            upstream rejects tools + reasoning — the GPT-5.6
                            family — and the alternative is auto-tried)
+    TOOLS_VIA_RESPONSES  auto|always|never (default auto). When a chat request
+                           carries function tools, serve it through the
+                           Responses API and translate the reply back into
+                           chat-completion shape. "auto" only bridges models
+                           whose upstream has no working chat shape for tools
+                           at all (the gpt-6 family); "always" also bridges the
+                           GPT-5.6 family, which keeps reasoning intact; "never"
+                           forwards the upstream 400 instead. Needs
+                           RESPONSES_ENABLED=1.
+    TOOLS_VIA_RESPONSES  auto|always|never (default auto). Serve a chat request
+                           that carries function tools through the Responses
+                           API and translate the reply back into
+                           chat-completion shape. "auto" only bridges models
+                           whose upstream has no working chat shape for tools
+                           at all (the gpt-6 family); "always" also bridges the
+                           GPT-5.6 family, which keeps reasoning intact; "never"
+                           forwards the upstream 400 instead. Needs
+                           RESPONSES_ENABLED=1.
     GPT56_SOL_UPSTREAM_MODEL     optional upstream model for gpt-5.6-sol
     GPT56_TERRA_UPSTREAM_MODEL   optional upstream model for gpt-5.6-terra
     GPT56_LUNA_UPSTREAM_MODEL   optional upstream model for gpt-5.6-luna
@@ -90,7 +120,7 @@ from portkey_ai import Portkey
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-PROXY_VERSION = "1.5.0"
+PROXY_VERSION = "1.7.0"
 
 # --------------------------------------------------------------------------- #
 # Environment / .env loading
@@ -143,6 +173,14 @@ INCLUDE_STREAM_USAGE = os.environ.get("INCLUDE_STREAM_USAGE", "1").lower() in (
     "yes",
     "on",
 )
+# POST /v1/responses is backed by the SDK's `client.responses.create`, which the
+# AI Sandbox does support (verified live 2026-09-29) despite the older FAQ note.
+RESPONSES_ENABLED = os.environ.get("RESPONSES_ENABLED", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 # Some upstreams (the GPT-5.6 family) reject chat-completions requests that
 # combine function tools with reasoning ("... set reasoning_effort to 'none'").
 # For those models only: when function tools are present, "strip" (default)
@@ -160,6 +198,14 @@ if TOOLS_REASONING_EFFORT not in ("strip", "none", "keep"):
         TOOLS_REASONING_EFFORT,
     )
     TOOLS_REASONING_EFFORT = "strip"
+# How /v1/chat/completions requests that carry function tools are served. See
+# the module docstring and _chat_to_responses_kwargs for why the bridge exists.
+TOOLS_VIA_RESPONSES = (os.environ.get("TOOLS_VIA_RESPONSES") or "auto").strip().lower()
+if TOOLS_VIA_RESPONSES not in ("auto", "always", "never"):
+    logging.warning(
+        "Invalid TOOLS_VIA_RESPONSES=%r; falling back to 'auto'", TOOLS_VIA_RESPONSES
+    )
+    TOOLS_VIA_RESPONSES = "auto"
 
 # --------------------------------------------------------------------------- #
 # Model registry
@@ -176,26 +222,39 @@ if TOOLS_REASONING_EFFORT not in ("strip", "none", "keep"):
 #   efforts        values the upstream accepts (None = unknown, forward as-is)
 #   fallback       value substituted when the client sends an unsupported one
 #   tools_conflict True when the upstream rejects tools + reasoning together
+#   tools_on_chat  False when NO chat-completions request shape accepts
+#                    function tools at all, so tools must go via /v1/responses
 
 REASONING_PROFILES: Dict[str, Dict[str, Any]] = {
-    # Rejects tools + reasoning in /v1/chat/completions and asks for
-    # reasoning_effort="none" instead; "none" is a valid value here.
+    # Rejects tools + reasoning in /v1/chat/completions (not on /v1/responses)
+    # and asks for reasoning_effort="none" instead; "none" is valid here, so
+    # the strip/none retry ladder has a working shape to fall back to.
     "gpt-5.6": {
         "efforts": ["none", "low", "medium", "high", "xhigh"],
         "fallback": "none",
         "tools_conflict": True,
+        "tools_on_chat": True,
     },
-    # Accepts tools + reasoning, but 'none' is not a valid effort:
-    # "Supported values are: 'low', 'medium', 'high', and 'xhigh'".
+    # No working chat shape for tools (verified live 2026-09-29): tools +
+    # reasoning 400s, reasoning_effort="none" 400s because 'none' is not a
+    # valid effort here, and omitting reasoning entirely still 400s since the
+    # upstream applies an implicit default effort. Tools only work on
+    # /v1/responses, hence tools_on_chat=False -> TOOLS_VIA_RESPONSES bridges.
     "gpt-6": {
         "efforts": ["low", "medium", "high", "xhigh"],
         "fallback": "low",
         "tools_conflict": False,
+        "tools_on_chat": False,
     },
     # Gemini-style upstreams: tools + reasoning is fine and the effort
     # vocabulary is theirs to define, so values pass through untouched
     # unless an explicit list is configured via the model's efforts_env.
-    "flexible": {"efforts": None, "fallback": None, "tools_conflict": False},
+    "flexible": {
+        "efforts": None,
+        "fallback": None,
+        "tools_conflict": False,
+        "tools_on_chat": True,
+    },
 }
 
 MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
@@ -274,6 +333,7 @@ def reasoning_caps(alias: str) -> Dict[str, Any]:
         "efforts": list(profile["efforts"]) if profile["efforts"] else None,
         "fallback": profile["fallback"],
         "tools_conflict": bool(profile["tools_conflict"]),
+        "tools_on_chat": bool(profile.get("tools_on_chat", True)),
     }
     override = _parse_efforts(os.environ.get(entry.get("efforts_env", ""), ""))
     if override:
@@ -295,10 +355,11 @@ def _effort_supported(caps: Dict[str, Any], effort: str) -> bool:
 #      rejects "none"). Those are rewritten to the model's fallback before the
 #      request goes out — see _sanitize_reasoning.
 #   2. A model may reject reasoning *entirely* when function tools are present
-#      (the GPT-5.6 family). Those requests are adjusted per
-#      TOOLS_REASONING_EFFORT and retried once with the alternative variant —
-#      see _tools_reasoning_plan. /v1/responses is not supported by the
-#      Sandbox, so there is no alternative endpoint to fall back on.
+#      (the GPT-5.6 family, on /v1/chat/completions only). Those requests are
+#      adjusted per TOOLS_REASONING_EFFORT and retried once with the
+#      alternative variant — see _tools_reasoning_plan. This conflict does not
+#      exist on /v1/responses, where the same models accept tools + reasoning,
+#      so the responses path never applies _tools_reasoning_plan.
 
 
 def _sanitize_reasoning(
@@ -485,6 +546,562 @@ def _error_payload(
 
 
 # --------------------------------------------------------------------------- #
+# Responses API request handling
+# --------------------------------------------------------------------------- #
+# /v1/responses is a different wire format from /v1/chat/completions, so it has
+# its own small translation layer. Deliberately *not* shared with the chat path:
+#   - reasoning is nested only (`reasoning: {"effort": ...}`); a flat
+#     `reasoning_effort` is a chat-completions parameter.
+#   - function tools are flat (`{"type": "function", "name", "parameters"}`),
+#     not nested under a `function` key.
+#   - the tools+reasoning conflict does not exist here, so _tools_reasoning_plan
+#     is never applied and reasoning is preserved for the GPT-5.6 family.
+# The SDK's responses.create() takes a keyword whitelist and folds anything else
+# into `extra_body`, so unknown client parameters still reach the gateway.
+
+_CHAT_ONLY_MESSAGE_KEYS = ("tool_calls", "function_call", "tool_call_id")
+_EASY_INPUT_ROLES = ("user", "assistant", "system", "developer")
+
+
+def _messages_are_easy_input(messages: Any) -> bool:
+    """True when a chat `messages` array maps 1:1 onto Responses `input`.
+
+    Only plain role+content messages do: tool results, tool calls and function
+    calls have different item shapes on the Responses API and must not be
+    renamed into `input` as if they were messages.
+    """
+    if not isinstance(messages, list) or not messages:
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            return False
+        if any(key in message for key in _CHAT_ONLY_MESSAGE_KEYS):
+            return False
+        if message.get("role") not in _EASY_INPUT_ROLES:
+            return False
+    return True
+
+
+def _responses_kwargs(
+    body: Dict[str, Any], caps: Dict[str, Any]
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Translate a /v1/responses request body into SDK kwargs.
+
+    Returns (kwargs, note); `note` describes any chat-shaped input that had to
+    be converted and is None when the body was already Responses-native.
+    """
+    kwargs = {k: v for k, v in body.items() if k not in ("model", "stream")}
+    notes: List[str] = []
+
+    # `stream_options` is a chat-completions parameter used to opt into usage in
+    # the stream. Responses reports usage on `response.completed` regardless,
+    # and the upstream rejects the parameter outright, so drop it rather than
+    # fail a request that is otherwise valid.
+    if kwargs.pop("stream_options", None) is not None:
+        notes.append("dropped stream_options (Responses always reports usage)")
+
+    # A flat reasoning_effort belongs to chat completions; the Responses API
+    # reads reasoning out of the nested object. Normalise so mixed clients get
+    # their effort honoured instead of a confusing upstream 400.
+    effort = kwargs.pop("reasoning_effort", None)
+    if effort is not None:
+        reasoning = kwargs.get("reasoning")
+        if isinstance(reasoning, dict) and "effort" in reasoning:
+            notes.append(
+                f"dropped reasoning_effort={effort!r} in favour of "
+                f"reasoning.effort={reasoning['effort']!r}"
+            )
+        else:
+            merged = dict(reasoning) if isinstance(reasoning, dict) else {}
+            merged["effort"] = effort
+            kwargs["reasoning"] = merged
+            notes.append(f"reasoning_effort={effort!r} -> reasoning.effort")
+
+    # Chat-shaped `messages` become Responses `input` when they are plain
+    # role+content items (all four roles are valid there, so it is a rename).
+    if "messages" in kwargs:
+        messages = kwargs.pop("messages")
+        if "input" in kwargs:
+            # `messages` is not a Responses parameter at all; forwarding it in
+            # the body would only confuse the gateway. Prefer the native key.
+            notes.append("dropped 'messages' in favour of 'input'")
+        elif _messages_are_easy_input(messages):
+            kwargs["input"] = messages
+            notes.append("messages -> input")
+        else:
+            raise ApiError(
+                400,
+                "This /v1/responses request carries a chat-style 'messages' "
+                "array that cannot be mapped onto Responses input items "
+                "(tool calls, tool results and function calls have their own "
+                "item shapes). Send 'input' in the Responses format, or use "
+                "POST /v1/chat/completions.",
+                param="messages",
+                code="unsupported_input_shape",
+            )
+
+    kwargs, rewrite = _sanitize_reasoning(kwargs, caps)
+    if rewrite:
+        notes.append(f"reasoning effort {rewrite}")
+    return kwargs, "; ".join(notes) or None
+
+
+# --------------------------------------------------------------------------- #
+# Bridge: serve chat-completions tool calls through the Responses API
+# --------------------------------------------------------------------------- #
+# Some upstreams (the gpt-6 family) have no chat-completions request shape that
+# accepts function tools at all — see REASONING_PROFILES["gpt-6"]. The Sandbox
+# error message offers two escape hatches that contradict each other ("use
+# /v1/responses or set reasoning_effort to 'none'", while 'none' is rejected for
+# those models), and omitting reasoning entirely still 400s because the upstream
+# applies an implicit default effort. /v1/responses does accept tools +
+# reasoning, so a chat client can still use those models if the proxy translates
+# the request over and the answer back.
+#
+# The client keeps speaking chat completions: same route, same request body,
+# same response shape (tool calls still nested under `function`), same SSE chunk
+# format and `data: [DONE]`. Only the upstream call changes.
+# Controlled by TOOLS_VIA_RESPONSES (auto | always | never).
+
+
+def _chat_content_to_input(content: Any) -> Any:
+    """Map chat message content onto Responses input content parts."""
+    if isinstance(content, str) or content is None:
+        return content if content is not None else ""
+    if not isinstance(content, list):
+        return content
+    parts: List[Dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            parts.append({"type": "input_text", "text": str(part)})
+            continue
+        kind = part.get("type")
+        if kind == "text":
+            parts.append({"type": "input_text", "text": part.get("text", "")})
+        elif kind in ("input_text", "input_image"):
+            parts.append(dict(part))  # already Responses-shaped
+        elif kind == "image_url":
+            image = part.get("image_url")
+            url = image.get("url") if isinstance(image, dict) else image
+            mapped: Dict[str, Any] = {"type": "input_image"}
+            if url:
+                mapped["image_url"] = url
+            if isinstance(image, dict) and image.get("detail"):
+                mapped["detail"] = image["detail"]
+            parts.append(mapped)
+        else:
+            parts.append(dict(part))
+    return parts
+
+
+_CHAT_INPUT_ROLES = ("user", "assistant", "system", "developer")
+
+
+def _chat_messages_to_input(messages: List[Any]) -> List[Dict[str, Any]]:
+    """Convert a chat `messages` array into Responses input items.
+
+    Tool calls and tool results are why a plain rename is not enough: an
+    assistant `tool_calls` message becomes one `function_call` item per call and
+    a `tool` message becomes a `function_call_output` item. Without that the
+    model would never see the tool output it is being asked about.
+    """
+    items: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role in ("tool", "function"):
+            output = message.get("content")
+            item: Dict[str, Any] = {
+                "type": "function_call_output",
+                "call_id": message.get("tool_call_id")
+                or message.get("call_id")
+                or "call_unknown",
+                "output": output if isinstance(output, str) else json.dumps(output),
+            }
+            if message.get("name"):
+                item["name"] = message["name"]
+            items.append(item)
+            continue
+        tool_calls = message.get("tool_calls") or message.get("function_call")
+        if tool_calls:
+            content = message.get("content")
+            if content:
+                items.append(
+                    {
+                        "role": "assistant",
+                        "type": "message",
+                        "content": _chat_content_to_input(content),
+                    }
+                )
+            calls = tool_calls if isinstance(tool_calls, list) else [tool_calls]
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                fn = (
+                    call["function"] if isinstance(call.get("function"), dict) else call
+                )
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call.get("id") or fn.get("id") or "call_unknown",
+                        "name": fn.get("name", ""),
+                        "arguments": fn.get("arguments") or "{}",
+                    }
+                )
+            continue
+        if role in _CHAT_INPUT_ROLES:
+            entry: Dict[str, Any] = {
+                "role": role,
+                "type": "message",
+                "content": _chat_content_to_input(message.get("content")),
+            }
+            if message.get("phase") in ("commentary", "final_answer"):
+                entry["phase"] = message["phase"]
+            items.append(entry)
+    return items
+
+
+def _chat_tools_to_responses(tools: Any) -> Any:
+    """Un-nest chat function tools (`{"function": {...}}`) for Responses."""
+    if not isinstance(tools, list):
+        return tools
+    flat: List[Dict[str, Any]] = []
+    for tool in tools:
+        if (
+            isinstance(tool, dict)
+            and tool.get("type") == "function"
+            and isinstance(tool.get("function"), dict)
+        ):
+            fn = tool["function"]
+            converted: Dict[str, Any] = {"type": "function"}
+            for key in ("name", "description", "parameters", "strict"):
+                if key in fn:
+                    converted[key] = fn[key]
+            flat.append(converted)
+        else:
+            flat.append(tool if not isinstance(tool, dict) else dict(tool))
+    return flat
+
+
+def _chat_tool_choice_to_responses(choice: Any) -> Any:
+    """Map chat `tool_choice` onto the Responses shape."""
+    if isinstance(choice, str) or choice is None:
+        return choice
+    if isinstance(choice, dict) and choice.get("type") == "function":
+        fn = choice["function"] if isinstance(choice.get("function"), dict) else {}
+        name = fn.get("name") or choice.get("name")
+        if name:
+            return {"type": "function", "name": name}
+    return choice
+
+
+# Chat parameters with no Responses equivalent: dropped, and logged as such.
+# `stream_options` matters most -- chat clients (and INCLUDE_STREAM_USAGE) send
+# it to request usage in the stream, but the Responses API reports usage on the
+# `response.completed` event unconditionally and the upstream rejects the
+# parameter outright ("Unknown parameter: 'stream_options.include_usage'").
+_BRIDGE_DROPPED_PARAMS = (
+    "stream_options",
+    "frequency_penalty",
+    "presence_penalty",
+    "logprobs",
+    "top_logprobs",
+    "n",
+    "seed",
+    "logit_bias",
+    "modalities",
+    "audio",
+    "prediction",
+    "web_search_options",
+)
+
+
+def _chat_to_responses_kwargs(
+    body: Dict[str, Any], caps: Dict[str, Any]
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Translate a /v1/chat/completions body into Responses kwargs."""
+    kwargs: Dict[str, Any] = {}
+    notes: List[str] = []
+    for key, value in body.items():
+        if key in ("model", "stream"):
+            continue
+        if key == "messages":
+            kwargs["input"] = _chat_messages_to_input(
+                value if isinstance(value, list) else []
+            )
+        elif key == "tools":
+            kwargs["tools"] = _chat_tools_to_responses(value)
+        elif key == "tool_choice":
+            kwargs["tool_choice"] = _chat_tool_choice_to_responses(value)
+        elif key in ("max_tokens", "max_completion_tokens"):
+            kwargs["max_output_tokens"] = value
+        elif key == "reasoning_effort":
+            reasoning = dict(kwargs.get("reasoning") or {})
+            reasoning["effort"] = value
+            kwargs["reasoning"] = reasoning
+        elif key == "response_format" and isinstance(value, dict):
+            # Chat json_* modes map onto Responses text.format.
+            if value.get("type") in ("json_object", "json_schema"):
+                text = dict(kwargs.get("text") or {})
+                text["format"] = dict(value)
+                kwargs["text"] = text
+            else:
+                notes.append("dropped response_format")
+        elif key in _BRIDGE_DROPPED_PARAMS:
+            # Includes stream_options: chat clients send it to opt into usage,
+            # but Responses reports usage on response.completed anyway.
+            notes.append(f"dropped {key}")
+        else:
+            kwargs[key] = value  # temperature, top_p, stop, user, metadata, ...
+    kwargs, rewrite = _sanitize_reasoning(kwargs, caps)
+    if rewrite:
+        notes.append(f"reasoning effort {rewrite}")
+    return kwargs, "; ".join(notes) or None
+
+
+def _responses_output_text(data: Dict[str, Any]) -> str:
+    """Concatenate every output_text part of a Response's message items."""
+    chunks: List[str] = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
+                text = part.get("text")
+                if isinstance(text, str):
+                    chunks.append(text)
+    return "".join(chunks)
+
+
+def _responses_to_chat_usage(usage: Any) -> Optional[Dict[str, Any]]:
+    """Re-express Responses usage with chat-completions token names."""
+    if not isinstance(usage, dict) or not usage:
+        return None
+    out: Dict[str, Any] = {
+        "prompt_tokens": usage.get("input_tokens", 0),
+        "completion_tokens": usage.get("output_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+    }
+    for src, dst in (
+        ("input_tokens_details", "prompt_tokens_details"),
+        ("output_tokens_details", "completion_tokens_details"),
+    ):
+        if isinstance(usage.get(src), dict):
+            out[dst] = dict(usage[src])
+    return out
+
+
+def _bridge_finish_reason(
+    data: Dict[str, Any], tool_calls: List[Dict[str, Any]]
+) -> str:
+    status = data.get("status")
+    if status == "incomplete":
+        reason = (data.get("incomplete_details") or {}).get("reason")
+        return "length" if reason == "max_output_tokens" else "content_filter"
+    if status in ("failed", "cancelled"):
+        return "stop"
+    return "tool_calls" if tool_calls else "stop"
+
+
+def _bridge_chat_id(response_id: Any) -> str:
+    """Render a Responses id (`resp_...` / `resp-...`) as a chat completion id."""
+    text = str(response_id or "")
+    if text.startswith("resp"):
+        rest = text[4:]
+        rest = rest[1:] if rest[:1] in ("_", "-") else rest
+        return f"chatcmpl-{rest}"
+    return text or "chatcmpl-0"
+
+
+def _responses_to_chat_completion(data: Dict[str, Any], alias: str) -> Dict[str, Any]:
+    """Convert a Responses body into an OpenAI chat.completion."""
+    tool_calls: List[Dict[str, Any]] = []
+    for item in data.get("output") or []:
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            tool_calls.append(
+                {
+                    "id": item.get("call_id")
+                    or item.get("id")
+                    or f"call_{len(tool_calls)}",
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments") or "",
+                    },
+                }
+            )
+    text = _responses_output_text(data)
+    message: Dict[str, Any] = {
+        "role": "assistant",
+        # Chat convention: content is null on a tool-only turn.
+        "content": text if text else (None if tool_calls else ""),
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    created = data.get("created_at")
+    return {
+        "id": _bridge_chat_id(data.get("id")),
+        "object": "chat.completion",
+        "created": (
+            int(created) if isinstance(created, (int, float)) else int(time.time())
+        ),
+        "model": alias,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "logprobs": None,
+                "finish_reason": _bridge_finish_reason(data, tool_calls),
+            }
+        ],
+        "usage": _responses_to_chat_usage(data.get("usage")),
+    }
+
+
+class _ResponsesToChatSSE:
+    """Stateful translator: Responses SSE events -> chat.completion chunks.
+
+    Reproduces the frame sequence a chat stream sends — a role delta first,
+    then content and/or `tool_calls` deltas, a finish_reason frame, an optional
+    usage frame, and `data: [DONE]` — so an unmodified chat client can drive a
+    bridged request.
+    """
+
+    def __init__(self, alias: str) -> None:
+        self.alias = alias
+        self.started = False
+        self.response_id = "chatcmpl-0"
+        self.created = int(time.time())
+        self.tool_indexes: Dict[Any, int] = {}
+        self.next_tool_index = 0
+        self.finish_reason: Optional[str] = None
+        self.usage: Optional[Dict[str, Any]] = None
+
+    def _chunk(self, delta: Dict[str, Any], finish_reason: Optional[str] = None) -> str:
+        self.started = True
+        return sse_frame(
+            {
+                **self._base(),
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": delta,
+                        "logprobs": None,
+                        "finish_reason": finish_reason,
+                    }
+                ],
+            }
+        )
+
+    def _base(self) -> Dict[str, Any]:
+        return {
+            "id": self.response_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.alias,
+        }
+
+    def _start(self) -> List[str]:
+        """The opening role delta, emitted once and only if nothing came first."""
+        return (
+            [] if self.started else [self._chunk({"role": "assistant", "content": ""})]
+        )
+
+    def _tool_index(self, key: Any) -> int:
+        if key is None:
+            return self.next_tool_index
+        if key not in self.tool_indexes:
+            self.tool_indexes[key] = self.next_tool_index
+            self.next_tool_index += 1
+        return self.tool_indexes[key]
+
+    def consume(self, event: Dict[str, Any]) -> List[str]:
+        """Translate one Responses event into zero or more chat chunks."""
+        kind = event.get("type")
+        if kind in ("response.created", "response.in_progress", "response.queued"):
+            self._capture_ids(event.get("response"))
+            return []
+        if kind == "response.output_item.added":
+            item = event.get("item") or {}
+            if item.get("type") != "function_call":
+                return []
+            index = self._tool_index(item.get("call_id") or event.get("output_index"))
+            self.finish_reason = "tool_calls"
+            return self._start() + [
+                self._chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": index,
+                                "id": item.get("call_id") or f"call_{index}",
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": "",
+                                },
+                            }
+                        ]
+                    }
+                )
+            ]
+        if kind == "response.output_text.delta":
+            delta = event.get("delta")
+            if not isinstance(delta, str) or not delta:
+                return []
+            return self._start() + [self._chunk({"content": delta})]
+        if kind == "response.function_call_arguments.delta":
+            delta = event.get("delta")
+            if not isinstance(delta, str) or not delta:
+                return []
+            index = self._tool_index(event.get("item_id") or event.get("output_index"))
+            self.finish_reason = "tool_calls"
+            return self._start() + [
+                self._chunk(
+                    {"tool_calls": [{"index": index, "function": {"arguments": delta}}]}
+                )
+            ]
+        if kind in ("response.completed", "response.incomplete", "response.failed"):
+            self._finish_from(event)
+            return []
+        return []
+
+    def _capture_ids(self, response: Any) -> None:
+        if not isinstance(response, dict):
+            return
+        if response.get("id"):
+            self.response_id = _bridge_chat_id(response.get("id"))
+        created = response.get("created_at")
+        if isinstance(created, (int, float)):
+            self.created = int(created)
+
+    def _finish_from(self, event: Dict[str, Any]) -> None:
+        response = event.get("response")
+        if not isinstance(response, dict):
+            return
+        self._capture_ids(response)
+        self.usage = _responses_to_chat_usage(response.get("usage"))
+        tool_calls = [
+            item
+            for item in response.get("output") or []
+            if isinstance(item, dict) and item.get("type") == "function_call"
+        ]
+        if event.get("type") == "response.completed":
+            self.finish_reason = "tool_calls" if tool_calls else "stop"
+        else:
+            self.finish_reason = _bridge_finish_reason(response, tool_calls)
+
+    def finish(self) -> List[str]:
+        """Closing frames: finish_reason, optional usage, and [DONE]."""
+        out = self._start()
+        out.append(self._chunk({}, self.finish_reason or "stop"))
+        if self.usage:
+            out.append(sse_frame({**self._base(), "choices": [], "usage": self.usage}))
+        out.append("data: [DONE]\n\n")
+        return out
+
+
+# --------------------------------------------------------------------------- #
 # Serialization helpers
 # --------------------------------------------------------------------------- #
 
@@ -502,6 +1119,20 @@ def to_json_dict(obj: Any) -> Dict[str, Any]:
 
 def sse_frame(payload: Dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+def sse_event_frame(payload: Dict[str, Any]) -> str:
+    """SSE frame for the Responses API, which names each event.
+
+    Chat-completions chunks carry no `type`, so they stay plain `data:` frames;
+    Responses stream events are typed (response.created,
+    response.output_text.delta, ...) and clients expect the `event:` line too.
+    """
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    event_type = payload.get("type")
+    if isinstance(event_type, str) and event_type:
+        return f"event: {event_type}\ndata: {body}\n\n"
+    return f"data: {body}\n\n"
 
 
 def _track_usage(alias: str, usage_data: Any, stream: bool) -> None:
@@ -569,12 +1200,14 @@ def resolve_api_key(request: Request) -> Optional[str]:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     logging.info(
-        "Portkey proxy v%s ready: upstream=%s models=%s fallback_key=%s tools_reasoning=%s",
+        "Portkey proxy v%s ready: upstream=%s models=%s fallback_key=%s "
+        "tools_reasoning=%s responses=%s",
         PROXY_VERSION,
         PORTKEY_BASE_URL,
         ", ".join(MODEL_REGISTRY),
         "configured" if FALLBACK_API_KEY else "none (per-request keys only)",
         TOOLS_REASONING_EFFORT,
+        "enabled" if RESPONSES_ENABLED else "disabled",
     )
     yield
     with _CLIENT_CACHE_LOCK:
@@ -621,6 +1254,52 @@ async def access_log(request: Request, call_next):
 
 
 # ----------------------------- chat completions ---------------------------- #
+
+
+async def _validated_request(
+    request: Request,
+) -> Tuple[Portkey, str, str, Dict[str, Any]]:
+    """Parse + authenticate a request body shared by both completions routes.
+
+    Returns (client, alias, upstream, body). Raises ApiError on any problem:
+    bad JSON, missing/unknown model, or no API key.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise ApiError(400, "Request body is not valid JSON.")
+    if not isinstance(body, dict):
+        raise ApiError(400, "Request body must be a JSON object.")
+
+    api_key = resolve_api_key(request)
+    if not api_key:
+        raise ApiError(
+            401,
+            "No API key provided. Enter your Portkey / AI Sandbox API key in the "
+            "Copilot app's model provider settings (it is sent as "
+            "'Authorization: Bearer <key>'), or set PORTKEY_API_KEY in the "
+            "proxy's environment or .env file as a fallback.",
+            err_type="authentication_error",
+            code="missing_api_key",
+        )
+    client = get_portkey_client(api_key)
+
+    model = body.get("model")
+    if not isinstance(model, str) or not model:
+        raise ApiError(
+            400,
+            "You must specify a 'model' in the request body.",
+            param="model",
+        )
+    if model not in MODEL_REGISTRY:
+        raise ApiError(
+            404,
+            f"The model `{model}` does not exist or you do not have access to it. "
+            f"Available models: {', '.join(sorted(MODEL_REGISTRY))}.",
+            code="model_not_found",
+            param="model",
+        )
+    return client, model, MODEL_REGISTRY[model]["upstream"], body
 
 
 def _sse_stream(
@@ -677,47 +1356,72 @@ def _sse_stream(
     yield "data: [DONE]\n\n"
 
 
+def _bridge_chat_to_responses(kwargs: Dict[str, Any], caps: Dict[str, Any]) -> bool:
+    """Whether a chat request with tools should be served via /v1/responses.
+
+    auto   -> only models with no working chat shape for tools (gpt-6 family)
+    always -> every request that carries function tools, so the GPT-5.6 family
+              keeps its reasoning instead of having it stripped
+    never  -> never bridge; the upstream 400 is forwarded to the client
+    """
+    if not RESPONSES_ENABLED or TOOLS_VIA_RESPONSES == "never":
+        return False
+    if not kwargs.get("tools"):
+        return False
+    if TOOLS_VIA_RESPONSES == "always":
+        return True
+    return not caps["tools_on_chat"]
+
+
+def _sse_bridged_stream(
+    client: Portkey,
+    upstream: str,
+    alias: str,
+    kwargs: Dict[str, Any],
+) -> Generator[str, None, None]:
+    """Stream the Responses API and re-emit chat-completion SSE chunks.
+
+    The client sees an ordinary chat stream: role delta, content/tool_calls
+    deltas, finish_reason, optional usage, then `data: [DONE]`.
+    """
+    translator = _ResponsesToChatSSE(alias)
+    recorded_usage = False
+    try:
+        stream = client.responses.create(model=upstream, stream=True, **kwargs)
+        for event in stream:
+            data = to_json_dict(event)
+            if not recorded_usage:
+                usage: Any = data.get("usage")
+                if not isinstance(usage, dict) or not usage:
+                    nested = data.get("response")
+                    if isinstance(nested, dict):
+                        usage = nested.get("usage")
+                if isinstance(usage, dict) and usage:
+                    recorded_usage = True
+                    _track_usage(alias, usage, stream=True)
+            for frame in translator.consume(data):
+                yield frame
+    except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
+        status, message, err_type, code, param = _exception_details(exc)
+        if status >= 500:
+            logging.exception("Bridged responses stream failed (status=%s)", status)
+        else:
+            logging.warning(
+                "Bridged responses stream failed (status=%s): %s", status, message
+            )
+        yield sse_frame(
+            {"error": _error_payload(message, err_type, code, param)["error"]}
+        )
+        yield "data: [DONE]\n\n"
+        return
+    for frame in translator.finish():
+        yield frame
+
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat_completions(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        raise ApiError(400, "Request body is not valid JSON.")
-    if not isinstance(body, dict):
-        raise ApiError(400, "Request body must be a JSON object.")
-
-    api_key = resolve_api_key(request)
-    if not api_key:
-        raise ApiError(
-            401,
-            "No API key provided. Enter your Portkey / AI Sandbox API key in the "
-            "Copilot app's model provider settings (it is sent as "
-            "'Authorization: Bearer <key>'), or set PORTKEY_API_KEY in the "
-            "proxy's environment or .env file as a fallback.",
-            err_type="authentication_error",
-            code="missing_api_key",
-        )
-    client = get_portkey_client(api_key)
-
-    model = body.get("model")
-    if not isinstance(model, str) or not model:
-        raise ApiError(
-            400,
-            "You must specify a 'model' in the request body.",
-            param="model",
-        )
-    if model not in MODEL_REGISTRY:
-        raise ApiError(
-            404,
-            f"The model `{model}` does not exist or you do not have access to it. "
-            f"Available models: {', '.join(sorted(MODEL_REGISTRY))}.",
-            code="model_not_found",
-            param="model",
-        )
-
-    alias = model
-    upstream = MODEL_REGISTRY[model]["upstream"]
+    client, alias, upstream, body = await _validated_request(request)
     stream = bool(body.get("stream", False))
 
     # Forward all remaining parameters untouched (temperature, max_tokens,
@@ -735,6 +1439,51 @@ async def chat_completions(request: Request):
         logging.info(
             "model=%s: reasoning_effort %s (unsupported upstream)", alias, rewrite
         )
+
+    # Some upstreams have no chat-completions shape for function tools at all
+    # (gpt-6 family); serve those through /v1/responses and translate back, so
+    # the client still gets an ordinary chat.completion.
+    if _bridge_chat_to_responses(kwargs, caps):
+        resp_kwargs, drop_note = _chat_to_responses_kwargs(body, caps)
+        logging.info(
+            "chat request bridged via responses: model=%s stream=%s tools=%s "
+            "reasoning=%s%s",
+            alias,
+            stream,
+            len(resp_kwargs.get("tools") or []),
+            _reasoning_desc(resp_kwargs),
+            f" ({drop_note})" if drop_note else "",
+        )
+        if not stream:
+            try:
+                bridged = await run_in_threadpool(
+                    client.responses.create, model=upstream, **resp_kwargs
+                )
+            except Exception as exc:  # noqa: BLE001
+                status, message, err_type, code, param = _exception_details(exc)
+                logging.warning(
+                    "Bridged responses error (status=%s, model=%s): %s",
+                    status,
+                    alias,
+                    message,
+                )
+                return JSONResponse(
+                    status_code=status,
+                    content=_error_payload(message, err_type, code, param),
+                )
+            raw = to_json_dict(bridged)
+            _track_usage(alias, raw.get("usage"), stream=False)
+            return JSONResponse(_responses_to_chat_completion(raw, alias))
+        return StreamingResponse(
+            _sse_bridged_stream(client, upstream, alias, resp_kwargs),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     attempts = _tools_reasoning_plan(kwargs, caps)
     reasoning_in = {
         k: kwargs[k] for k in ("reasoning_effort", "reasoning") if k in kwargs
@@ -864,20 +1613,136 @@ async def root():
         "models": sorted(MODEL_REGISTRY),
         "endpoints": {
             "chat_completions": "POST /v1/chat/completions",
+            "responses": "POST /v1/responses",
             "models": "GET /v1/models",
             "usage": "GET /v1/usage",
         },
     }
 
 
+# ------------------------------- responses API ----------------------------- #
+
+
+def _rewrite_response_models(payload: Dict[str, Any], alias: str) -> Dict[str, Any]:
+    """Report the alias the client asked for, wherever a model name appears.
+
+    Responses events carry the model both at the top level (the non-streaming
+    body) and nested inside the `response` object (response.created,
+    response.completed, ...). Only existing keys are rewritten: delta events
+    have no model field and must not grow one.
+    """
+    if "model" in payload:
+        payload["model"] = alias
+    nested = payload.get("response")
+    if isinstance(nested, dict) and "model" in nested:
+        nested["model"] = alias
+    return payload
+
+
+def _sse_responses_stream(
+    client: Portkey,
+    upstream: str,
+    alias: str,
+    kwargs: Dict[str, Any],
+) -> Generator[str, None, None]:
+    """Run the SDK Responses stream and re-emit typed OpenAI SSE events.
+
+    Unlike chat completions there is no `data: [DONE]` sentinel: the stream
+    ends with a `response.completed` event, which also carries the usage block.
+    There is no tools+reasoning conflict on this endpoint, so a single request
+    variant is used (no _tools_reasoning_plan retry ladder).
+    """
+    recorded_usage = False
+    try:
+        stream = client.responses.create(model=upstream, stream=True, **kwargs)
+        for event in stream:
+            data = _rewrite_response_models(to_json_dict(event), alias)
+            if not recorded_usage:
+                usage: Any = data.get("usage")
+                if not isinstance(usage, dict) or not usage:
+                    nested = data.get("response")
+                    if isinstance(nested, dict):
+                        usage = nested.get("usage")
+                if isinstance(usage, dict) and usage:
+                    recorded_usage = True
+                    _track_usage(alias, usage, stream=True)
+            yield sse_event_frame(data)
+    except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
+        status, message, err_type, code, param = _exception_details(exc)
+        if status >= 500:
+            logging.exception("Upstream responses stream failed (status=%s)", status)
+        else:
+            logging.warning(
+                "Upstream responses stream failed (status=%s): %s", status, message
+            )
+        yield sse_event_frame(
+            {
+                "type": "error",
+                "message": message,
+                "code": code,
+                "param": param,
+            }
+        )
+
+
 @app.post("/v1/responses")
 @app.post("/responses")
-async def responses_not_supported():
-    raise ApiError(
-        404,
-        "The OpenAI Responses API is not supported by this proxy (the AI Sandbox "
-        "only supports chat completions). Use POST /v1/chat/completions instead.",
-        code="unsupported_endpoint",
+async def responses_create(request: Request):
+    if not RESPONSES_ENABLED:
+        raise ApiError(
+            404,
+            "The OpenAI Responses API is disabled on this proxy "
+            "(set RESPONSES_ENABLED=1 to enable it). Use "
+            "POST /v1/chat/completions instead.",
+            code="unsupported_endpoint",
+        )
+    client, alias, upstream, body = await _validated_request(request)
+    stream = bool(body.get("stream", False))
+
+    caps = reasoning_caps(alias)
+    kwargs, note = _responses_kwargs(body, caps)
+    if note:
+        logging.info("responses request: model=%s: %s", alias, note)
+    logging.info(
+        "responses request: model=%s stream=%s tools=%s reasoning=%s",
+        alias,
+        stream,
+        bool(kwargs.get("tools")),
+        _reasoning_desc(kwargs),
+    )
+
+    if not stream:
+        try:
+            response = await run_in_threadpool(
+                client.responses.create, model=upstream, **kwargs
+            )
+        except Exception as exc:  # noqa: BLE001
+            status, message, err_type, code, param = _exception_details(exc)
+            logging.warning(
+                "Upstream responses error (status=%s, model=%s): %s",
+                status,
+                alias,
+                message,
+            )
+            return JSONResponse(
+                status_code=status,
+                content=_error_payload(message, err_type, code, param),
+            )
+        data = _rewrite_response_models(to_json_dict(response), alias)
+        data.setdefault("object", "response")
+        _track_usage(alias, data.get("usage"), stream=False)
+        return JSONResponse(data)
+
+    # Streaming: headers are sent before the request is made, so upstream
+    # errors are surfaced as a typed SSE error event.
+    return StreamingResponse(
+        _sse_responses_stream(client, upstream, alias, kwargs),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -951,6 +1816,10 @@ def main() -> None:
     print(f"   Models         : {', '.join(sorted(MODEL_REGISTRY))}")
     print(f"   Streaming usage: {'on' if INCLUDE_STREAM_USAGE else 'off'}")
     print(
+        "   Responses API  : "
+        + ("enabled (POST /v1/responses)" if RESPONSES_ENABLED else "disabled")
+    )
+    print(
         "   Usage tracking: "
         + (
             f"on -> {usage_mod.USAGE_LOG_PATH} "
@@ -970,7 +1839,11 @@ def main() -> None:
     print("=" * 72)
     print(" In the Copilot app model provider settings, use:")
     print(f"   Base URL : http://{args.host}:{args.port}/v1")
-    print("   Wire API : Completions   (the AI Sandbox does not support Responses)")
+    print(
+        "   Wire API : Completions (recommended) or Responses"
+        if RESPONSES_ENABLED
+        else "   Wire API : Completions   (Responses is disabled on this proxy)"
+    )
     print("   API key  : <your Portkey / AI Sandbox key>")
     print()
     print(" Or for GitHub Copilot CLI, export:")

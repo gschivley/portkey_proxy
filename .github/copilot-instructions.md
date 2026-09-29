@@ -4,9 +4,9 @@
 
 A single-file local HTTP proxy (`proxy.py`) that lets GitHub Copilot talk to the
 Princeton AI Sandbox (Portkey gateway). It exposes an OpenAI-compatible API
-(`POST /v1/chat/completions`, `GET /v1/models`) and translates requests into
-calls to the `portkey_ai` Python SDK, converting responses (including streaming
-SSE) back into OpenAI JSON/SSE.
+(`POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/models`) and
+translates requests into calls to the `portkey_ai` Python SDK, converting
+responses (including streaming SSE) back into OpenAI JSON/SSE.
 
 ## Commands
 
@@ -19,7 +19,7 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the full integration test suite (108 checks; boots a mock upstream + the real proxy)
+# Run the full integration test suite (162 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -31,7 +31,8 @@ pip install -r requirements.txt
 ## Architecture
 
 - `proxy.py` — everything: `.env` loading, model registry, reasoning handling,
-  Portkey client cache, FastAPI app, error translation, `main()`.
+  Portkey client cache, FastAPI app (chat completions + Responses API), error
+  translation, `main()`.
 - `usage.py` — usage & cost tracking (imported by `proxy.py` and `usage_report.py`).
   Reads its config at import time (after `.env` loading). `PricingCache` fetches
   `GET {PRICING_BASE_URL}/pricing/<provider>/<model>` (public Portkey API) with a
@@ -42,21 +43,30 @@ pip install -r requirements.txt
 - `usage_report.py` — CLI over the same JSONL log (works while the proxy is stopped).
 - `mock_upstream.py` — mock OpenAI-compatible upstream used by the tests. Records
   every request to `_captured.json` and supports test-only "personality" modes via
-  a `mock_upstream_mode` body field (popped before forwarding). Also serves
+  a `mock_upstream_mode` body field (popped before forwarding). Serves both
+  `/v1/chat/completions` and `/v1/responses` (the responses route deliberately
+  accepts tools + reasoning, matching the real upstream on that endpoint, and
+  rejects chat-only `stream_options` the way the real one does). Test-only
+  `mock_tool_call` makes the responses route emit a `function_call` item (with
+  streamed argument deltas) instead of a message. Also serves
   `GET /pricing/<provider>/<model>` (fixed `openai`/`google` rates; `anthropic`
   404s to exercise the no-pricing path) and honors a `mock_cached_tokens` field to
   report cached input tokens in `usage`.
 - `test_proxy.py` — end-to-end integration test: starts `mock_upstream.py` and
   `proxy.py` as subprocesses on free ports, drives them with `httpx`, asserts with
-  `check()`. Section 9 boots a dedicated tracking proxy with `USAGE_TRACKING=1`
-  pointed at isolated `_usage_test.jsonl` / `_pricing_cache_test.json` files.
+  `check()`. Section 7 covers `/v1/responses`; section 8 covers the
+  chat→Responses bridge (tool-call round trip, multi-turn tool history,
+  `stream_options` dropping); section 9 boots a dedicated tracking
+  proxy with `USAGE_TRACKING=1` pointed at isolated `_usage_test.jsonl` /
+  `_pricing_cache_test.json` files.
 - `portkey_text_example.py` / `faqs.txt` — reference material from Princeton
   (official SDK example and AI Sandbox FAQ); not part of the proxy.
 
 ### Request flow
 
-1. Copilot sends an OpenAI chat-completions request to the proxy.
-2. `chat_completions` validates the model against `MODEL_REGISTRY` (aliases only;
+1. Copilot sends an OpenAI chat-completions (or Responses) request to the proxy.
+2. `chat_completions` / `responses_create` validate the model against
+   `MODEL_REGISTRY` via the shared `_validated_request` helper (aliases only;
    unknown → 404 `model_not_found`).
 3. The API key is resolved per request: `Authorization: Bearer` →
    `x-portkey-api-key` → optional `PORTKEY_API_KEY`/`AI_SANDBOX_KEY` fallback.
@@ -64,15 +74,43 @@ pip install -r requirements.txt
 4. All other body params are forwarded untouched; the alias is rewritten to the
    registry's `upstream` model.
 5. The `portkey_ai` SDK call is made with a cached client (one per API key,
-   max 16).
+   max 16): `client.chat.completions.create` or `client.responses.create`.
 6. Responses are converted back to OpenAI JSON/SSE; `model` is rewritten to the
    alias the client asked for; errors are translated to OpenAI-shaped error JSON.
 
 ## Key conventions
 
 - **Routes are mounted twice**: every endpoint exists at both `/v1/...` and bare
-  `/...` (e.g. `/v1/chat/completions` and `/chat/completions`). Keep both when
-  adding endpoints.
+  `/...` (e.g. `/v1/chat/completions` and `/chat/completions`, `/v1/responses`
+  and `/responses`). Keep both when adding endpoints.
+- **Two wire APIs, bridged for tools**: `/v1/chat/completions` and
+  `/v1/responses` are both served and the *client* picks one. Never hand a chat
+  client a `response` body (or vice versa) — the shapes are not interchangeable.
+  The one sanctioned exception is `TOOLS_VIA_RESPONSES` (default `auto`): a chat
+  request carrying function tools is *served* via `client.responses.create` and
+  translated **back** into `chat.completion` / chat SSE by
+  `_chat_to_responses_kwargs`, `_responses_to_chat_completion` and
+  `_ResponsesToChatSSE`, so the client never knows. `auto` bridges only models
+  with `tools_on_chat: False` (the gpt-6 family, which rejects tools on chat in
+  every shape); `always` also bridges GPT-5.6 (preserving its reasoning);
+  `never` forwards the upstream 400. Requires `RESPONSES_ENABLED=1`. Log line:
+  `chat request bridged via responses: ...`.
+  Responses gotchas: function tools are **flat**
+  (`{"type":"function","name",...,"parameters":...}`, not nested under
+  `function`); reasoning is **nested only** (`reasoning.effort`, and
+  `_responses_kwargs` normalises a chat-style flat `reasoning_effort` into it);
+  usage reports `input_tokens`/`output_tokens` (normalised by
+  `usage.extract_tokens` into the same JSONL schema as chat); the stream ends
+  with a `response.completed` event and must **not** emit `data: [DONE]`; error
+  events are flat `{"type":"error","message",...}`. `RESPONSES_ENABLED=0`
+  restores the 404 stub. `previous_response_id` is forwarded untouched and is
+  verified to work on the Sandbox.
+- **Never leak chat-only params into a Responses call**: the upstream rejects
+  them (`Unknown parameter: 'stream_options.include_usage'`). `stream_options`
+  in particular is sent by chat clients *and* by `INCLUDE_STREAM_USAGE`, and is
+  dropped by both `_responses_kwargs` and `_BRIDGE_DROPPED_PARAMS` — Responses
+  reports usage on `response.completed` regardless. `mock_upstream.py` mirrors
+  this rejection so the suite catches regressions.
 - **Model aliases vs upstream models**: `MODEL_REGISTRY` maps the names Copilot
   requests (e.g. `gpt-5.6-sol`) to upstream deployment names. Each alias can be
   overridden with `*_UPSTREAM_MODEL` env vars. Add new models to `MODEL_REGISTRY`
@@ -82,13 +120,18 @@ pip install -r requirements.txt
   → `gemini-3.8-flash-gt-128k`).
 - **Reasoning is per-model, not global**: `REASONING_PROFILES` captures three
   upstream quirks:
-  - `gpt-5.6` — upstream rejects function `tools` + reasoning together.
+  - `gpt-5.6` — upstream rejects function `tools` + reasoning together **on
+    /v1/chat/completions only** (it accepts them on /v1/responses).
     `TOOLS_REASONING_EFFORT` (`strip`/`none`/`keep`) controls the first attempt;
     if the upstream still returns the tools+reasoning 400, the proxy auto-retries
     once with the alternative variant (both streaming and non-streaming).
-  - `gpt-6` — accepts tools + reasoning but rejects `"none"`; unsupported effort
-    values are rewritten to the model's fallback (first non-`none` configured
-    value).
+  - `gpt-6` — **`tools_on_chat: False`**: rejects function tools on chat
+    completions in *every* shape (tools+reasoning 400s; `"none"` 400s because it
+    is not a valid effort; omitting reasoning still 400s as the upstream applies
+    an implicit default effort), so the strip/retry ladder cannot help and these
+    requests are bridged via /v1/responses instead. Without tools, `"none"` is
+    still rejected and unsupported effort values are rewritten to the model's
+    fallback (first non-`none` configured value).
   - `flexible` — forwards effort values untouched unless an explicit
     `*_REASONING_EFFORTS` env list is configured.
   - When adding a model, pick a profile (or add one) and update
@@ -127,4 +170,4 @@ pip install -r requirements.txt
   actually forwarded; it's gitignored and deleted at the end of the run.
 - Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log` (gitignored).
 - After changing proxy behavior, run `./.venv/bin/python test_proxy.py` and
-  confirm "ALL TESTS PASSED" (108 checks).
+  confirm "ALL TESTS PASSED" (162 checks).

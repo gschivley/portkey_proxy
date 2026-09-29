@@ -77,9 +77,18 @@ def parse_sse(text: str) -> list[dict]:
     frames = []
     for block in text.split("\n\n"):
         block = block.strip()
-        if not block or not block.startswith("data:"):
+        if not block:
             continue
-        data = block[len("data:") :].strip()
+        # Responses API frames carry an `event: <type>` line before the data;
+        # chat-completion chunks do not. Collect every data: line in the block.
+        data_lines = [
+            line[len("data:") :].strip()
+            for line in block.splitlines()
+            if line.strip().startswith("data:")
+        ]
+        if not data_lines:
+            continue
+        data = "\n".join(data_lines)
         if data == "[DONE]":
             frames.append({"done": True})
         else:
@@ -356,8 +365,11 @@ def main() -> int:
         )
 
         # 2d. gpt-6-astra / gemini: reasoning is model-specific -------------
-        # gpt-6-astra accepts tools + reasoning together, so nothing is
-        # stripped; only values the model rejects ('none') are rewritten.
+        # gpt-6-astra has NO working chat-completions shape for function tools
+        # (tools+reasoning 400s, 'none' 400s, and stripping reasoning still
+        # 400s), so a tools-bearing chat request is bridged through
+        # /v1/responses: reasoning is preserved as the nested shape the client
+        # asked for, and the reply is translated back to chat-completion form.
         astra_body = {
             "model": "gpt-6-astra",
             "messages": [{"role": "user", "content": "Hi"}],
@@ -369,6 +381,12 @@ def main() -> int:
         check(
             "astra: client-facing model", r.json().get("model") == "gpt-6-astra", r.text
         )
+        check(
+            "astra: bridged reply keeps chat.completion shape",
+            r.json().get("object") == "chat.completion"
+            and r.json()["choices"][0]["message"]["role"] == "assistant",
+            r.text,
+        )
         cap = json.loads(CAPTURE.read_text())
         check(
             "astra: mapped to upstream-astra",
@@ -376,9 +394,21 @@ def main() -> int:
             str(cap["body"].get("model")),
         )
         check(
+            "astra: bridged to the responses endpoint",
+            "input" in cap["body"] and "messages" not in cap["body"],
+            str(sorted(cap["body"])),
+        )
+        check(
+            "astra: tools flattened for responses",
+            bool(cap["body"].get("tools"))
+            and cap["body"]["tools"][0].get("name") == "f"
+            and "function" not in cap["body"]["tools"][0],
+            str(cap["body"].get("tools")),
+        )
+        check(
             "astra: reasoning_effort kept (not stripped) with tools",
-            cap["body"].get("reasoning_effort") == "high",
-            str(cap["body"].get("reasoning_effort")),
+            cap["body"].get("reasoning") == {"effort": "high"},
+            str(cap["body"].get("reasoning")),
         )
 
         # 'none' is not a valid astra effort -> rewritten to the fallback.
@@ -390,8 +420,8 @@ def main() -> int:
         cap = json.loads(CAPTURE.read_text())
         check(
             "astra: none rewritten to fallback 'low'",
-            cap["body"].get("reasoning_effort") == "low",
-            str(cap["body"].get("reasoning_effort")),
+            (cap["body"].get("reasoning") or {}).get("effort") == "low",
+            str(cap["body"].get("reasoning")),
         )
 
         # Same for the nested reasoning.effort shape.
@@ -424,8 +454,9 @@ def main() -> int:
         cap = json.loads(CAPTURE.read_text())
         check(
             "astra: xhigh forwarded unchanged",
-            r.status_code == 200 and cap["body"].get("reasoning_effort") == "xhigh",
-            str(cap["body"].get("reasoning_effort")),
+            r.status_code == 200
+            and (cap["body"].get("reasoning") or {}).get("effort") == "xhigh",
+            str(cap["body"].get("reasoning")),
         )
 
         # An upstream that rejects 'none' outright must still be satisfied.
@@ -445,8 +476,8 @@ def main() -> int:
         cap = json.loads(CAPTURE.read_text())
         check(
             "astra: rewrite reached upstream as 'low'",
-            cap["body"].get("reasoning_effort") == "low",
-            str(cap["body"].get("reasoning_effort")),
+            (cap["body"].get("reasoning") or {}).get("effort") == "low",
+            str(cap["body"].get("reasoning")),
         )
 
         # Streaming path gets the same treatment.
@@ -642,11 +673,7 @@ def main() -> int:
             "invalid JSON -> 400", r.status_code == 400 and "error" in r.json(), r.text
         )
 
-        r = client.post("/v1/responses", json={"model": "gpt-5.6-sol"})
-        check(
-            "responses API -> 404 with message",
-            r.status_code == 404 and "chat completions" in r.json()["error"]["message"],
-        )
+        # (/v1/responses is a real endpoint — covered in section 7.)
 
         # 5. Per-request API key (the key set in the Copilot app) ---------
         r = client.post(
@@ -760,7 +787,8 @@ def main() -> int:
         cap = json.loads(CAPTURE.read_text())
         check(
             "mode=none does not force none onto astra",
-            r.status_code == 200 and cap["body"].get("reasoning_effort") == "medium",
+            r.status_code == 200
+            and (cap["body"].get("reasoning") or {}).get("effort") == "medium",
             r.text,
         )
 
@@ -795,6 +823,493 @@ def main() -> int:
             "env effort list keeps supported values",
             r.status_code == 200 and cap["body"].get("reasoning_effort") == "medium",
             str(cap["body"].get("reasoning_effort")),
+        )
+
+        # 7. Responses API (/v1/responses) --------------------------------
+        # Responses-native request: nested reasoning, FLAT function tools.
+        resp_body = {
+            "model": "gpt-5.6-sol",
+            "input": "Hi there",
+            "reasoning": {"effort": "medium"},
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                }
+            ],
+        }
+        r = client.post("/v1/responses", json=resp_body)
+        j = r.json()
+        check("responses non-stream status 200", r.status_code == 200, r.text)
+        check("responses non-stream object", j.get("object") == "response", str(j))
+        check(
+            "responses client-facing model",
+            j.get("model") == "gpt-5.6-sol",
+            str(j.get("model")),
+        )
+        check(
+            "responses output text",
+            j.get("output", [{}])[0].get("content", [{}])[0].get("text")
+            == "Hello from mock upstream!",
+            str(j.get("output")),
+        )
+        check(
+            "responses usage passthrough",
+            j.get("usage", {}).get("input_tokens") == 12
+            and j.get("usage", {}).get("output_tokens") == 8,
+            str(j.get("usage")),
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "responses model rewritten upstream",
+            cap["body"].get("model") == "upstream-sol",
+            str(cap["body"].get("model")),
+        )
+        check(
+            "responses input forwarded",
+            cap["body"].get("input") == "Hi there",
+            str(cap["body"].get("input")),
+        )
+        check(
+            "responses flat tools forwarded untouched",
+            cap["body"].get("tools", [{}])[0].get("name") == "get_weather",
+            str(cap["body"].get("tools")),
+        )
+        # The headline difference from chat completions: the GPT-5.6 family
+        # accepts tools + reasoning here, so reasoning must NOT be stripped.
+        check(
+            "responses keeps reasoning with tools (gpt-5.6)",
+            cap["body"].get("reasoning") == {"effort": "medium"},
+            str(cap["body"].get("reasoning")),
+        )
+        check(
+            "responses forwards auth key",
+            cap["headers"].get("x-portkey-api-key") == "sk-portkey-test",
+            str(cap["headers"].get("x-portkey-api-key")),
+        )
+        r = client.post("/responses", json=resp_body)
+        check("bare /responses also works", r.status_code == 200, r.text)
+
+        # A flat reasoning_effort (chat-completions style) is normalised into
+        # the nested shape the Responses API reads.
+        r = client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.6-terra", "input": "Hi", "reasoning_effort": "high"},
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "flat reasoning_effort -> reasoning.effort",
+            r.status_code == 200
+            and cap["body"].get("reasoning") == {"effort": "high"}
+            and "reasoning_effort" not in cap["body"],
+            str(cap["body"]),
+        )
+
+        # Chat-style `messages` become Responses `input` when they are plain
+        # role+content items.
+        r = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.6-terra",
+                "messages": [
+                    {"role": "system", "content": "Be brief."},
+                    {"role": "user", "content": "Hi"},
+                ],
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "messages -> input conversion",
+            r.status_code == 200
+            and cap["body"].get("input", [{}])[0].get("role") == "system"
+            and "messages" not in cap["body"],
+            str(cap["body"]),
+        )
+
+        # Chat tool items have no Responses message shape: reject clearly
+        # instead of silently mangling them.
+        r = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.6-terra",
+                "messages": [
+                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+                ],
+            },
+        )
+        check(
+            "chat tool messages -> 400 unsupported_input_shape",
+            r.status_code == 400
+            and r.json()["error"].get("code") == "unsupported_input_shape",
+            r.text,
+        )
+
+        # When a body carries both, the native Responses key wins and the
+        # chat-only one is dropped rather than forwarded to the gateway.
+        r = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.6-terra",
+                "input": "native",
+                "messages": [{"role": "user", "content": "chat"}],
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "input wins over messages",
+            r.status_code == 200
+            and cap["body"].get("input") == "native"
+            and "messages" not in cap["body"],
+            str(cap["body"]),
+        )
+
+        # Per-model effort vocabulary still applies: astra rejects 'none'.
+        r = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-6-astra",
+                "input": "Hi",
+                "reasoning": {"effort": "none"},
+                "mock_upstream_mode": "reject_none_effort",
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "responses rewrites unsupported effort (astra none -> low)",
+            r.status_code == 200 and cap["body"]["reasoning"]["effort"] == "low",
+            str(cap["body"].get("reasoning")),
+        )
+
+        # Flexible models forward an unknown effort untouched.
+        r = client.post(
+            "/v1/responses",
+            json={
+                "model": "gemini-3.8-flash",
+                "input": "Hi",
+                "reasoning": {"effort": "minimal"},
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "responses forwards unknown effort for flexible models",
+            r.status_code == 200 and cap["body"]["reasoning"]["effort"] == "minimal",
+            str(cap["body"].get("reasoning")),
+        )
+
+        # Streaming: typed events, text reassembles, usage arrives once, and
+        # there is no chat-style [DONE] sentinel.
+        r = client.post("/v1/responses", json={**resp_body, "stream": True})
+        check(
+            "responses stream content type",
+            r.status_code == 200
+            and r.headers.get("content-type", "").startswith("text/event-stream"),
+            str(r.headers.get("content-type")),
+        )
+        frames = parse_sse(r.text)
+        deltas = [
+            f.get("delta", "")
+            for f in frames
+            if f.get("type") == "response.output_text.delta"
+        ]
+        check(
+            "responses stream reassembles text",
+            "".join(deltas) == "Hello from mock upstream!",
+            str(deltas),
+        )
+        completed = [f for f in frames if f.get("type") == "response.completed"]
+        check(
+            "responses stream ends with response.completed",
+            len(completed) == 1 and bool(completed[0].get("response")),
+            str([f.get("type") for f in frames]),
+        )
+        check(
+            "responses stream has no [DONE] frame",
+            not any(f.get("done") for f in frames),
+            str([f.get("type") for f in frames]),
+        )
+        check(
+            "responses stream rewrites model to alias",
+            completed and completed[0]["response"].get("model") == "gpt-5.6-sol",
+            str(completed),
+        )
+        usage_frames = [
+            f
+            for f in frames
+            if isinstance(f.get("usage"), dict)
+            or isinstance((f.get("response") or {}).get("usage"), dict)
+        ]
+        check(
+            "responses stream carries usage exactly once",
+            len(usage_frames) == 1
+            and usage_frames[0]["response"]["usage"].get("input_tokens") == 12,
+            str([f.get("type") for f in usage_frames]),
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "responses stream forwarded upstream with model rewrite",
+            cap["body"].get("model") == "upstream-sol",
+            str(cap["body"].get("model")),
+        )
+
+        # Errors on this endpoint are OpenAI-shaped too.
+        r = client.post("/v1/responses", json={"model": "does-not-exist", "input": "x"})
+        check(
+            "responses unknown model -> 404",
+            r.status_code == 404 and r.json()["error"]["code"] == "model_not_found",
+            r.text,
+        )
+        r = client.post("/v1/responses", json={"input": "x"})
+        check(
+            "responses missing model -> 400",
+            r.status_code == 400 and r.json()["error"]["param"] == "model",
+            r.text,
+        )
+        r = client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.6-sol", "input": "x", "fail": "auth"},
+        )
+        check(
+            "responses upstream 401 -> 401 OpenAI error",
+            r.status_code == 401
+            and r.json()["error"]["message"] == "Invalid API key provided.",
+            r.text,
+        )
+        r = client.post(
+            "/v1/responses",
+            content=b"{not json",
+            headers={"content-type": "application/json"},
+        )
+        check(
+            "responses invalid JSON -> 400",
+            r.status_code == 400 and "error" in r.json(),
+            r.text,
+        )
+
+        # 8. Chat -> Responses bridge (models with no chat shape for tools) --
+        # gpt-6-astra tools requests are bridged above; here we verify the
+        # tool-call round trip comes back in chat form.
+        bridge_body = {
+            "model": "gpt-6-astra",
+            "messages": [{"role": "user", "content": "Weather in Paris?"}],
+            "tools": req_body["tools"],
+            "mock_tool_call": {"name": "f", "arguments": '{"city":"Paris"}'},
+        }
+        r = client.post("/v1/chat/completions", json=bridge_body)
+        j = r.json()
+        msg = (j.get("choices") or [{}])[0].get("message", {})
+        check("bridge: tool call -> 200", r.status_code == 200, r.text)
+        check(
+            "bridge: finish_reason is tool_calls",
+            (j.get("choices") or [{}])[0].get("finish_reason") == "tool_calls",
+            str(j.get("choices")),
+        )
+        check(
+            "bridge: tool_calls nested under function (chat shape)",
+            bool(msg.get("tool_calls"))
+            and msg["tool_calls"][0]["function"]["name"] == "f"
+            and msg["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}',
+            str(msg),
+        )
+        check(
+            "bridge: content null on a tool-only turn",
+            msg.get("content") is None,
+            str(msg.get("content")),
+        )
+        check(
+            "bridge: usage renamed to chat token names",
+            j.get("usage", {}).get("prompt_tokens") == 12
+            and j.get("usage", {}).get("completion_tokens") == 8,
+            str(j.get("usage")),
+        )
+        check(
+            "bridge: id/object/model are chat-shaped",
+            j.get("object") == "chat.completion"
+            and str(j.get("id", "")).startswith("chatcmpl")
+            and j.get("model") == "gpt-6-astra",
+            str({k: j.get(k) for k in ("object", "id", "model")}),
+        )
+
+        # Streaming bridge: deltas reassemble into one tool call, then
+        # finish_reason and [DONE] exactly like a chat stream.
+        r = client.post("/v1/chat/completions", json={**bridge_body, "stream": True})
+        frames = parse_sse(r.text)
+        check(
+            "bridge stream: ends with [DONE]",
+            bool(frames) and frames[-1].get("done") is True,
+            str([f.get("type") for f in frames])[:200],
+        )
+        check(
+            "bridge stream: no responses-style events leak through",
+            not any(str(f.get("type", "")).startswith("response.") for f in frames),
+            str([f.get("type") for f in frames])[:200],
+        )
+        deltas = [
+            c.get("delta", {})
+            for f in frames
+            if not f.get("done")
+            for c in f.get("choices") or []
+        ]
+        rebuilt = {"args": "", "name": None, "id": None}
+        for delta in deltas:
+            for call in delta.get("tool_calls") or []:
+                if call.get("id"):
+                    rebuilt["id"] = call["id"]
+                fn = call.get("function") or {}
+                if fn.get("name"):
+                    rebuilt["name"] = fn["name"]
+                rebuilt["args"] += fn.get("arguments") or ""
+        check(
+            "bridge stream: tool call reassembled from argument deltas",
+            rebuilt["name"] == "f"
+            and rebuilt["args"] == '{"city":"Paris"}'
+            and bool(rebuilt["id"]),
+            str(rebuilt),
+        )
+        check(
+            "bridge stream: role delta first",
+            deltas and deltas[0].get("role") == "assistant",
+            str(deltas[:1]),
+        )
+        finish = [
+            c.get("finish_reason")
+            for f in frames
+            if not f.get("done")
+            for c in f.get("choices") or []
+            if c.get("finish_reason")
+        ]
+        check(
+            "bridge stream: finish_reason tool_calls emitted",
+            finish == ["tool_calls"],
+            str(finish),
+        )
+        usage_frames = [f for f in frames if f.get("usage")]
+        check(
+            "bridge stream: exactly one usage frame in chat names",
+            len(usage_frames) == 1
+            and usage_frames[0]["usage"].get("prompt_tokens") == 12,
+            str(usage_frames),
+        )
+
+        # Copilot sends `stream_options` on every streaming chat request, but
+        # the Responses upstream rejects it outright -- the bridge must drop it
+        # (usage still arrives, via response.completed).
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                **astra_body,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+        frames = parse_sse(r.text)
+        check(
+            "bridge stream: chat stream_options dropped, still 200",
+            r.status_code == 200
+            and not any("error" in f for f in frames)
+            and frames
+            and frames[-1].get("done") is True,
+            r.text[:200],
+        )
+        check(
+            "bridge stream: usage still captured without stream_options",
+            any(f.get("usage") for f in frames),
+            str([f.get("usage") for f in frames if f.get("usage")]),
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "bridge: stream_options never reaches the responses upstream",
+            "stream_options" not in cap["body"],
+            str(sorted(cap["body"])),
+        )
+        r = client.post(
+            "/v1/chat/completions",
+            json={**astra_body, "stream_options": {"include_usage": True}},
+        )
+        check(
+            "bridge non-stream: stream_options dropped",
+            r.status_code == 200 and r.json().get("object") == "chat.completion",
+            r.text[:200],
+        )
+
+        # Multi-turn tool history must survive the conversion, or the model
+        # never sees the tool output it is being asked about.
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-6-astra",
+                "messages": [
+                    {"role": "user", "content": "Weather?"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "f",
+                                    "arguments": '{"city":"Paris"}',
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+                    {"role": "user", "content": "thanks"},
+                ],
+                "tools": req_body["tools"],
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        items = cap["body"].get("input") or []
+        kinds = [i.get("type") or i.get("role") for i in items]
+        check(
+            "bridge: assistant tool_calls -> function_call item",
+            any(
+                i.get("type") == "function_call"
+                and i.get("call_id") == "call_1"
+                and i.get("name") == "f"
+                for i in items
+            ),
+            str(kinds),
+        )
+        check(
+            "bridge: tool result -> function_call_output item",
+            any(
+                i.get("type") == "function_call_output"
+                and i.get("call_id") == "call_1"
+                and i.get("output") == "sunny"
+                for i in items
+            ),
+            str(kinds),
+        )
+        check(
+            "bridge: max_tokens -> max_output_tokens",
+            r.status_code == 200,
+            r.text,
+        )
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-6-astra",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": req_body["tools"],
+                "max_tokens": 128,
+                "frequency_penalty": 0.5,
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "bridge: max_tokens renamed, chat-only params dropped",
+            cap["body"].get("max_output_tokens") == 128
+            and "frequency_penalty" not in cap["body"]
+            and "max_tokens" not in cap["body"],
+            str(cap["body"]),
         )
 
         # 9. Usage & cost tracking (dedicated proxy, isolated log/cache) ---
@@ -948,15 +1463,44 @@ def main() -> int:
             str(gem),
         )
 
-        # GET /v1/usage and /usage aggregation (seed + 4 tracked requests).
-        spent = 49.9999 + mock_in + mock_nosplit + mock_gem
+        # Responses API: input_tokens/output_tokens are normalised into the
+        # same canonical schema, so cost matches the chat equivalent.
+        r = client3.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.6-luna",
+                "input": "Hi",
+                "mock_cached_tokens": 4,
+            },
+        )
+        check("usage: responses request ok", r.status_code == 200, r.text)
+        luna = [x for x in usage_records() if x["model"] == "gpt-5.6-luna"]
+        check("usage: responses recorded once", len(luna) == 1, str(len(luna)))
+        if luna:
+            ln = luna[0]
+            check(
+                "usage: responses tokens normalised to chat schema",
+                ln["prompt_tokens"] == 12
+                and ln["cached_tokens"] == 4
+                and ln["completion_tokens"] == 8
+                and ln["reasoning_tokens"] == 3,
+                str(ln),
+            )
+            check(
+                "usage: responses cost equals chat equivalent",
+                ln["cost_usd"] is not None and abs(ln["cost_usd"] - mock_in) < 1e-9,
+                str(ln.get("cost_usd")),
+            )
+
+        # GET /v1/usage and /usage aggregation (seed + 5 tracked requests).
+        spent = 49.9999 + mock_in + mock_nosplit + mock_gem + mock_in
         r = client3.get("/v1/usage")
         rep = r.json() if r.status_code == 200 else {}
         check("usage: GET /v1/usage -> 200", r.status_code == 200, r.text)
         check(
             "usage: month, request count and spend",
             rep.get("month") == month_now
-            and rep.get("requests") == 5
+            and rep.get("requests") == 6
             and abs(rep.get("spent_usd", 0) - spent) < 1e-6,
             str(rep),
         )
@@ -974,6 +1518,7 @@ def main() -> int:
                 "seed-model",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
+                "gpt-5.6-luna",
                 "claude-fable-5",
                 "gemini-3.8-flash",
             },
@@ -987,7 +1532,7 @@ def main() -> int:
         r = client3.get("/usage")
         check(
             "usage: bare /usage aggregates the same",
-            r.status_code == 200 and r.json().get("requests") == 5,
+            r.status_code == 200 and r.json().get("requests") == 6,
             r.text,
         )
         r = client3.get("/v1/usage", params={"month": "2020-01"})
