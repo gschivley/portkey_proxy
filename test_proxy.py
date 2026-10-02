@@ -149,6 +149,10 @@ def main() -> int:
     )
 
     base = f"http://127.0.0.1:{proxy_port}"
+    # The router section boots its own proxies; register them here so the
+    # finally block can shut them all down.
+    rprocs: list = []
+
     try:
         if not wait_ready(f"{base}/health"):
             print("ERROR: proxy did not become ready; see _proxy.log")
@@ -2118,8 +2122,514 @@ def main() -> int:
 
         client4.close()
 
+        # 11. Free-first router ----------------------------------------------
+        # Three router instances, one per budget state:
+        #   proxy5  tracking on, spend $0        -> the paid tier is usable
+        #   proxy6  tracking off (spend unknown) -> the approval gate applies
+        #   proxy7  tracking on, spend over cap  -> free models only
+        attempts_file = ROOT / "_captured_attempts.jsonl"
+
+        def boot_router(suffix: str, **overrides):
+            env_r = dict(env)
+            env_r.update(
+                {
+                    "ROUTER_ENABLED": "1",
+                    "NRP_API_KEY": "nrp-test-key",
+                    "NRP_BASE_URL": f"http://127.0.0.1:{mock_port}/v1",
+                    "ROUTER_PAID_POOL": "gpt-6-luna,gpt-5.6-sol",
+                    "ROUTER_HARD_POOL": "gpt-6-luna,gpt-5.6-sol",
+                    "ROUTER_REVIEW_POOL": "gpt-6-luna,gpt-5.6-sol",
+                    "ROUTER_MAX_ATTEMPTS": "4",
+                    "USAGE_TRACKING": "1",
+                    "USAGE_LOG_PATH": str(ROOT / f"_router_{suffix}.jsonl"),
+                    "PRICING_CACHE_PATH": str(ROOT / f"_pricing_cache_router_{suffix}.json"),
+                    "PRICING_BASE_URL": f"http://127.0.0.1:{mock_port}",
+                }
+            )
+            env_r.update(overrides)
+            (ROOT / f"_router_{suffix}.jsonl").unlink(missing_ok=True)
+            (ROOT / f"_pricing_cache_router_{suffix}.json").unlink(missing_ok=True)
+            port = free_port()
+            log = open(ROOT / f"_proxy{suffix}.log", "w")
+            proc = subprocess.Popen(
+                [PY, str(ROOT / "proxy.py"), "--port", str(port)],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                cwd=ROOT,
+                env=env_r,
+            )
+            rprocs.append((proc, log))
+            base_r = f"http://127.0.0.1:{port}"
+            if not wait_ready(f"{base_r}/health"):
+                raise RuntimeError(f"router proxy {suffix} did not start")
+            return httpx.Client(base_url=base_r, timeout=30.0)
+
+        def attempt_models() -> list[str]:
+            """Upstream model names the mock actually received, in order."""
+            if not attempts_file.exists():
+                return []
+            return [
+                json.loads(line)["body"]["model"]
+                for line in attempts_file.read_text().splitlines()
+                if line.strip()
+            ]
+
+        def reset_attempts() -> None:
+            attempts_file.unlink(missing_ok=True)
+
+        def proxy_log_text(name: str) -> str:
+            return (ROOT / name).read_text(encoding="utf-8", errors="replace")
+
+        rc5 = boot_router("5")
+        r = rc5.get("/health")
+        check(
+            "router: /health advertises the virtual aliases",
+            r.status_code == 200
+            and r.json().get("router_enabled") is True
+            and {"auto-free", "auto-hard", "auto-review"} <= set(r.json()["models"]),
+            r.text[:200],
+        )
+        ids = [m["id"] for m in rc5.get("/v1/models").json()["data"]]
+        check(
+            "router: /v1/models lists aliases but not pool names",
+            {"auto-free", "auto-hard", "auto-review"} <= set(ids)
+            and not {"free", "paid", "hard", "review"} & set(ids),
+            str(sorted(set(ids))),
+        )
+        st = rc5.get("/v1/router").json()
+        check(
+            "router: status reports pools and gates",
+            st["enabled"] is True
+            and st["pools"]["free"] == ["qwen3", "deepseek-v4-flash", "glm-5"]
+            and st["pools"]["hard"] == ["gpt-6-luna", "gpt-5.6-sol"]
+            and st["max_attempts"] == 4
+            and st["spend"]["approval_threshold_usd"] == 230.0
+            and st["spend"]["budget_exhausted"] is False,
+            json.dumps(st)[:250],
+        )
+
+        # --- free-first selection ------------------------------------------
+        reset_attempts()
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={"model": "auto-free", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: auto-free serves the first free model",
+            r.status_code == 200
+            and r.headers.get("x-proxy-model") == "qwen3"
+            and r.headers.get("x-proxy-route") == "auto-free"
+            and attempt_models() == ["qwen3"],
+            f"{r.status_code} {r.headers.get('x-proxy-model')} {attempt_models()}",
+        )
+        reset_attempts()
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={"model": "auto-hard", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: auto-hard serves a paid model while the budget is open",
+            r.status_code == 200
+            and r.headers.get("x-proxy-model") == "gpt-6-luna"
+            and attempt_models() == ["upstream-luna"],
+            f"{r.status_code} {r.headers.get('x-proxy-model')} {attempt_models()}",
+        )
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={"model": "auto-review", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: auto-review uses the review pool",
+            r.status_code == 200 and r.headers.get("x-proxy-model") == "gpt-6-luna",
+            r.text[:150],
+        )
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto-free",
+                "messages": [{"role": "user", "content": "hi"}],
+                "proxy_routing": {"task": "hard"},
+            },
+        )
+        check(
+            "router: task=hard hint upgrades an auto-free request to paid",
+            r.status_code == 200 and r.headers.get("x-proxy-model") == "gpt-6-luna",
+            f"{r.status_code} {r.headers.get('x-proxy-model')}",
+        )
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto-hard",
+                "messages": [{"role": "user", "content": "hi"}],
+                "proxy_routing": {"allow_paid": False},
+            },
+        )
+        check(
+            "router: allow_paid=false keeps even auto-hard on free models",
+            r.status_code == 200 and r.headers.get("x-proxy-model") == "qwen3",
+            f"{r.status_code} {r.headers.get('x-proxy-model')}",
+        )
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto-free",
+                "messages": [{"role": "user", "content": "hi"}],
+                "proxy_routing": {"nonsense": True},
+            },
+        )
+        check(
+            "router: unknown routing hint -> 400 invalid_routing",
+            r.status_code == 400
+            and r.json()["error"]["code"] == "invalid_routing"
+            and "nonsense" in r.json()["error"]["message"],
+            r.text[:200],
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "router: proxy_routing never reaches the upstream",
+            "proxy_routing" not in cap["body"] and "proxy_routing" not in cap,
+            str(sorted(cap["body"]))[:200],
+        )
+
+        # --- capability filtering ------------------------------------------
+        reset_attempts()
+        r = rc5.post("/v1/responses", json={"model": "auto-free", "input": "hi"})
+        check(
+            "router: plain responses request uses a free model",
+            r.status_code == 200
+            and r.headers.get("x-proxy-model") == "qwen3"
+            and attempt_models() == ["qwen3"],
+            f"{r.status_code} {r.headers.get('x-proxy-model')} {attempt_models()}",
+        )
+        reset_attempts()
+        r = rc5.post("/v1/responses", json={"model": "auto-free", "input": "hi", "store": True})
+        check(
+            "router: native-only param routes around capability-less models",
+            r.status_code == 200
+            and r.headers.get("x-proxy-model") == "gpt-6-luna"
+            and attempt_models() == ["upstream-luna"],
+            f"{r.status_code} {r.headers.get('x-proxy-model')} {attempt_models()}",
+        )
+        r = rc5.post("/v1/responses", json={"model": "auto-free", "input": "hi", "store": False})
+        check(
+            "router: a falsy native-only param does not exclude free models",
+            r.status_code == 200 and r.headers.get("x-proxy-model") == "qwen3",
+            f"{r.status_code} {r.headers.get('x-proxy-model')}",
+        )
+
+        # --- explicit models keep their legacy behaviour --------------------
+        reset_attempts()
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "router: explicit model is served by itself, untouched",
+            r.status_code == 200
+            and "x-proxy-model" not in r.headers
+            and cap["body"]["model"] == "upstream-sol"
+            and attempt_models() == ["upstream-sol"],
+            f"{r.status_code} {dict(r.headers)}",
+        )
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={"model": "no-such-model", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: unknown model still 404s",
+            r.status_code == 404 and r.json()["error"]["type"] == "invalid_request_error",
+            r.text[:150],
+        )
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-6.1-sol",
+                "messages": [{"role": "user", "content": "hi"}],
+                "proxy_routing": {"allow_paid": False},
+            },
+        )
+        check(
+            "router: allow_paid=false with an explicit paid model -> 400",
+            r.status_code == 400 and "allow_paid" in r.text,
+            r.text[:150],
+        )
+
+        # --- bounded fallback ----------------------------------------------
+        # 404 (not 5xx) because the SDK silently retries 5xx inside one attempt.
+        reset_attempts()
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto-hard",
+                "messages": [{"role": "user", "content": "hi"}],
+                "mock_fail_models": ["upstream-luna"],
+                "mock_fail_status": 404,
+            },
+        )
+        check(
+            "router: a failed candidate falls through to the next model",
+            r.status_code == 200
+            and r.headers.get("x-proxy-model") == "gpt-5.6-sol"
+            and attempt_models() == ["upstream-luna", "upstream-sol"],
+            f"{r.status_code} {r.headers.get('x-proxy-model')} {attempt_models()}",
+        )
+        reset_attempts()
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto-hard",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+                "mock_fail_models": ["upstream-luna"],
+                "mock_fail_status": 404,
+            },
+        )
+        chunks = parse_sse(r.text)
+        check(
+            "router: streaming falls back before any byte reaches the client",
+            r.status_code == 200
+            and r.headers.get("x-proxy-model") == "gpt-5.6-sol"
+            and attempt_models() == ["upstream-luna", "upstream-sol"]
+            and any(c.get("choices") for c in chunks)
+            and not any("error" in c for c in chunks),
+            f"{r.status_code} {attempt_models()} {str(chunks)[:200]}",
+        )
+        reset_attempts()
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto-hard",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+                "mock_stream_break": True,
+            },
+        )
+        chunks = parse_sse(r.text)
+        check(
+            "router: a stream that dies mid-body is never replayed",
+            r.status_code == 200
+            and attempt_models() == ["upstream-luna"]
+            and any("error" in c for c in chunks),
+            f"{attempt_models()} {str(chunks)[:250]}",
+        )
+
+        # --- verified quota exhaustion -> free only -------------------------
+        reset_attempts()
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto-hard",
+                "messages": [{"role": "user", "content": "hi"}],
+                "mock_fail_models": ["upstream-luna"],
+                "mock_fail_status": 402,
+                "mock_fail_code": "insufficient_quota",
+            },
+        )
+        check(
+            "router: exhaustion mid-request reverts to free models",
+            r.status_code == 200
+            and r.headers.get("x-proxy-model") == "qwen3"
+            and attempt_models() == ["upstream-luna", "qwen3"],
+            f"{r.status_code} {r.headers.get('x-proxy-model')} {attempt_models()}",
+        )
+        st = rc5.get("/v1/router").json()
+        check(
+            "router: exhausted scope is reported",
+            st["exhausted_scopes"] != [] and st["spend"]["budget_exhausted"] is False,
+            json.dumps(st)[:250],
+        )
+        reset_attempts()
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={"model": "auto-hard", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: after exhaustion, routes skip the paid tier entirely",
+            r.status_code == 200
+            and r.headers.get("x-proxy-model") == "qwen3"
+            and attempt_models() == ["qwen3"],
+            f"{attempt_models()} {r.headers.get('x-proxy-model')}",
+        )
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: explicit paid model is refused once exhausted",
+            r.status_code == 402
+            and r.json()["error"]["code"] == "budget_exhausted"
+            and "qwen3" in r.json()["error"]["message"]
+            and "/v1/router/reset" in r.json()["error"]["message"],
+            r.text[:250],
+        )
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={"model": "auto-free", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: free models keep working while paid is exhausted",
+            r.status_code == 200 and r.headers.get("x-proxy-model") == "qwen3",
+            r.text[:150],
+        )
+        r = rc5.post("/v1/router/reset")
+        st = rc5.get("/v1/router").json()
+        reset_attempts()
+        r = rc5.post(
+            "/v1/chat/completions",
+            json={"model": "auto-hard", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: POST /v1/router/reset re-enables the paid tier",
+            r.status_code == 200
+            and r.headers.get("x-proxy-model") == "gpt-6-luna"
+            and st["exhausted_scopes"] == [],
+            f"{r.status_code} {r.headers.get('x-proxy-model')} {attempt_models()}",
+        )
+
+        # --- observability without prompt logging ---------------------------
+        secret = "PROMPT-MUST-NOT-BE-LOGGED-4f2a"
+        rc5.post(
+            "/v1/chat/completions",
+            json={"model": "auto-free", "messages": [{"role": "user", "content": secret}]},
+        )
+        log5 = proxy_log_text("_proxy5.log")
+        check(
+            "router: decision is logged with alias and gate",
+            "router: alias=auto-free gate=free-first" in log5,
+            log5[-400:],
+        )
+        check(
+            "router: prompts and keys are not logged",
+            secret not in log5 and "nrp-test-key" not in log5,
+            [ln for ln in log5.splitlines() if secret in ln][:2],
+        )
+
+        # --- approval gate (spend unknown) ---------------------------------
+        rc6 = boot_router("6", USAGE_TRACKING="0")
+        st = rc6.get("/v1/router").json()
+        check(
+            "router: unknown spend requires approval for paid models",
+            st["spend"]["spend_usd"] is None and st["spend"]["approval_required"] is True,
+            json.dumps(st["spend"]),
+        )
+        reset_attempts()
+        r = rc6.post(
+            "/v1/chat/completions",
+            json={"model": "auto-hard", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: unapproved route reverts to free models",
+            r.status_code == 200 and r.headers.get("x-proxy-model") == "qwen3",
+            f"{r.status_code} {r.headers.get('x-proxy-model')}",
+        )
+        r = rc6.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-6-luna", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: explicit paid without approval -> 402",
+            r.status_code == 402
+            and r.json()["error"]["code"] == "paid_approval_required"
+            and "paid_approved" in r.json()["error"]["message"],
+            r.text[:250],
+        )
+        r = rc6.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-6-luna",
+                "messages": [{"role": "user", "content": "hi"}],
+                "proxy_routing": {"paid_approved": True},
+            },
+        )
+        check(
+            "router: paid_approved=true serves the paid model",
+            r.status_code == 200 and "x-proxy-model" not in r.headers,
+            r.text[:150],
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "router: approval hint is not forwarded upstream",
+            "proxy_routing" not in cap["body"] and cap["body"]["model"] == "upstream-luna",
+            str(sorted(cap["body"]))[:200],
+        )
+        r = rc6.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto-hard",
+                "messages": [{"role": "user", "content": "hi"}],
+                "proxy_routing": {"paid_approved": True},
+            },
+        )
+        check(
+            "router: approval also unlocks the hard route",
+            r.status_code == 200 and r.headers.get("x-proxy-model") == "gpt-6-luna",
+            f"{r.status_code} {r.headers.get('x-proxy-model')}",
+        )
+
+        # --- monthly cap reached -------------------------------------------
+        rc7 = boot_router("7")
+        # Spend is read lazily and cached per process, so seed the log now.
+        (ROOT / "_router_7.jsonl").write_text(
+            json.dumps(
+                {
+                    "month": time.strftime("%Y-%m"),
+                    "model": "gpt-6-luna",
+                    "cost_usd": 260.0,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        st = rc7.get("/v1/router").json()
+        check(
+            "router: cap reached is reported",
+            st["spend"]["spend_usd"] == 260.0
+            and st["spend"]["budget_exhausted"] is True
+            and st["spend"]["monthly_budget_usd"] == 250.0,
+            json.dumps(st["spend"]),
+        )
+        reset_attempts()
+        r = rc7.post(
+            "/v1/chat/completions",
+            json={"model": "auto-hard", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: over budget, routed requests use free models",
+            r.status_code == 200 and r.headers.get("x-proxy-model") == "qwen3",
+            f"{r.status_code} {r.headers.get('x-proxy-model')} {attempt_models()}",
+        )
+        r = rc7.post(
+            "/v1/chat/completions",
+            json={"model": "auto-free", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: auto-free is unaffected by the budget gate",
+            r.status_code == 200 and r.headers.get("x-proxy-model") == "qwen3",
+            r.text[:150],
+        )
+        reset_attempts()
+        r = rc7.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-6-luna", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        check(
+            "router: over budget, explicit paid requests are refused",
+            r.status_code == 402 and r.json()["error"]["code"] == "budget_exhausted",
+            r.text[:200],
+        )
+        check(
+            "router: over budget blocks the paid tier without a round trip",
+            attempt_models() == [],
+            str(attempt_models()),
+        )
+        rc5.close()
+        rc6.close()
+        rc7.close()
+
     finally:
-        procs = [(proxy, proxy_log), (mock, mock_log)]
+        procs = [(proxy, proxy_log), (mock, mock_log), *rprocs]
         if proxy2 is not None:
             procs.append((proxy2, proxy2_log))
         if proxy3 is not None:
@@ -2136,9 +2646,17 @@ def main() -> int:
             log.close()
         if CAPTURE.exists():
             CAPTURE.unlink()
-        for leftover in (ROOT / "_usage_test.jsonl", ROOT / "_pricing_cache_test.json"):
+        for leftover in (
+            ROOT / "_usage_test.jsonl",
+            ROOT / "_pricing_cache_test.json",
+            ROOT / "_captured_attempts.jsonl",
+        ):
             if leftover.exists():
                 leftover.unlink()
+        for leftover in list(ROOT.glob("_router_*.jsonl")) + list(
+            ROOT.glob("_pricing_cache_router_*.json")
+        ):
+            leftover.unlink()
 
     print()
     print(f"  {len(PASSED)} passed, {len(FAILED)} failed")

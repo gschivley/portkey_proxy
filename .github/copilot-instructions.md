@@ -5,8 +5,11 @@
 A single-file local HTTP proxy (`proxy.py`) that lets GitHub Copilot talk to the
 Princeton AI Sandbox (Portkey gateway). It exposes an OpenAI-compatible API
 (`POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/models`) and
-translates requests into calls to the `portkey_ai` Python SDK, converting
-responses (including streaming SSE) back into OpenAI JSON/SSE.
+translates requests into calls to the `portkey_ai` Python SDK (and, for the
+zero-cost NRP models, a plain OpenAI client), converting responses (including
+streaming SSE) back into OpenAI JSON/SSE. An opt-in router (`ROUTER_ENABLED=1`,
+`routing.py`) adds the virtual aliases `auto-free` / `auto-hard` / `auto-review`
+with capability filtering, bounded fallback, and advisory budget gates.
 
 ## Commands
 
@@ -19,11 +22,14 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the full integration test suite (212 checks; boots a mock upstream + the real proxy)
+# Run the router policy unit suite (86 checks; no server needed)
+./.venv/bin/python test_routing.py
+
+# Run the full integration test suite (250 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
-- The test suite is a single monolithic script (`test_proxy.py`), **not** pytest —
+- Both suites are single monolithic scripts, **not** pytest —
   `pytest test_proxy.py` collects nothing. There is no per-test filter; to run a
   subset, temporarily comment out sections in `main()`.
 - No linter or formatter is configured; there is no `pyproject.toml` or `Makefile`.
@@ -33,7 +39,18 @@ pip install -r requirements.txt
 - `proxy.py` — everything: `.env` loading, model registry, reasoning handling,
   client cache (Portkey SDK + plain OpenAI client for NRP), FastAPI app (chat
   completions + Responses API), the Responses→chat bridge for `responses_via_chat`
-  models, error translation, `main()`.
+  models, the router integration (`_validated_request` plan hook, `_run_routed`
+  candidate ladder, `/v1/router` endpoints), error translation, `main()`.
+- `routing.py` — the router policy layer, deliberately free of FastAPI/SDK calls
+  so it is unit-testable. `parse_hints()` validates the `proxy_routing` request
+  field; `Router.plan()` turns a model alias + hints + request body into an
+  ordered candidate ladder (`Plan`) or a `RoutingError`; `Router.free_fallback()`
+  produces the paid→free revert list; `Router.scope_exhausted()` /
+  `mark_exhausted()` track verified Portkey quota exhaustion (keyed by a SHA-256
+  hash of the API key, never the key itself) and `is_quota_exhaustion()` decides
+  whether an upstream error proves the wallet is spent; `status()` backs
+  `GET /v1/router`. Spend is read lazily through an injected `spend_provider`
+  (default `usage.spent_this_month`) and cached per calendar month.
 - `usage.py` — usage & cost tracking (imported by `proxy.py` and `usage_report.py`).
   Reads its config at import time (after `.env` loading). `PricingCache` fetches
   `GET {PRICING_BASE_URL}/pricing/<provider>/<model>` (public Portkey API) with a
@@ -57,16 +74,28 @@ pip install -r requirements.txt
   `GET /pricing/<provider>/<model>` (fixed `openai`/`google` rates; `anthropic`
   404s to exercise the no-pricing path) and honors a `mock_cached_tokens` field to
   report cached input tokens in `usage` and a `mock_cache_write_tokens` field to
-  report cache-write input tokens.
+  report cache-write input tokens. Router hooks: every request is also appended
+  to `_captured_attempts.jsonl` (the last-attempt-only `_captured.json` cannot
+  show a fallback ladder), `mock_fail_status` / per-model failure directives make
+  one candidate fail, and `mock_stream_break` kills a stream after the first
+  chunk.
 - `test_proxy.py` — end-to-end integration test: starts `mock_upstream.py` and
   `proxy.py` as subprocesses on free ports, drives them with `httpx`, asserts with
   `check()`. Section 7 covers `/v1/responses`; section 8 covers the
   chat→Responses bridge (tool-call round trip, multi-turn tool history,
   `stream_options` dropping); section 9 boots a dedicated tracking
   proxy with `USAGE_TRACKING=1` pointed at isolated `_usage_test.jsonl` /
-  `_pricing_cache_test.json` files; section 10 boots a proxy with
+  `_pricing_cache_test.json` files; section 11 boots three router proxies (spend
+  $0, spend unknown, spend over cap) pointed at the mock with `ROUTER_ENABLED=1`
+  and covers alias advertising, free-first order, hints, capability filtering,
+  explicit passthrough, 404-driven fallback in JSON and streaming, mid-stream
+  breaks that must not replay, 402 exhaustion reverts, and the approval/cap
+  gates; section 10 boots a proxy with
   `NRP_API_KEY`/`NRP_BASE_URL` pointed at the mock to cover the NRP Bearer auth
   and the Responses→chat bridge.
+- `test_routing.py` — unit suite for `routing.py` (no subprocesses): builds
+  routers with `make_router()` and asserts on candidate ladders, gate strings,
+  error codes, and config handling.
 - `portkey_text_example.py` / `faqs.txt` — reference material from Princeton
   (official SDK example and AI Sandbox FAQ); not part of the proxy.
 
@@ -170,6 +199,25 @@ pip install -r requirements.txt
   - When adding a model, pick a profile (or add one) and update
     `REASONING_PROFILES`/`MODEL_REGISTRY`; the tests in `test_proxy.py` cover all
     three behaviors.
+- **Router rules** (`routing.py` owns the policy; `proxy.py` only dispatches):
+  `allow_paid: false` is a hard veto that outranks the alias (`auto-hard` with
+  the veto is served by the free pool), while an explicitly named paid model
+  with the veto is a 400. Capability filtering may only *exclude* a candidate —
+  a request is never silently rewritten to make a model fit, and if nothing can
+  serve it the client gets 400 `unsupported_native_feature` /
+  `no_eligible_model`. **Never replay a request once bytes reached the client**:
+  `_prime_stream` pulls the first SSE chunk before the response is committed and
+  a later mid-stream failure is surfaced as an SSE error frame on that response.
+  Budget gates are advisory: `auto-*` routes degrade to the free pool rather
+  than fail, and only an explicitly named paid model can be refused
+  (402 `paid_approval_required` at/above `PAID_APPROVAL_THRESHOLD_USD` — or when
+  spend is unknown, e.g. `USAGE_TRACKING=0` — and 402 `budget_exhausted` at
+  `MONTHLY_BUDGET_USD` or once a scope is verified exhausted). In-flight
+  exhaustion reverts to free models inside the same request
+  (`Plan.free_fallback`). Every `routing_mod.RoutingError` escaping into a route
+  must be translated to `ApiError`; the catch-all handler would return a 500 and
+  reset the keep-alive connection, producing a misleading `httpx.ReadError` on
+  the *next* request.
 - **Errors are OpenAI-shaped**: `ApiError` + `_exception_details` map SDK
   exception class names (e.g. `RateLimitError` → 429) to
   `{"error": {message, type, param, code}}`. Streaming errors are emitted as SSE
@@ -190,8 +238,12 @@ pip install -r requirements.txt
   the request body to simulate upstream personalities; keep it out of forwarded
   params.
 - **Logging**: the access-log middleware logs every request; the proxy logs
-  `chat request: ...` lines that are the primary debugging signal. Use
-  `logging.info`/`warning` with the existing format.
+  `chat request: ...` and `router: alias=… gate=…` lines (decision lines carry
+  no prompts, keys, or token counts) that are the primary debugging signal. Use
+  `logging.info`/`warning` with the existing format. `main()` passes
+  `basicConfig(force=True)` because enabling the router logs at import time, and
+  that first `logging.info` installs a WARNING root handler that would otherwise
+  swallow all INFO output.
 - **Python 3.10+**, `from __future__ import annotations`, type hints on public
   functions. No type checker is configured.
 
@@ -201,6 +253,12 @@ pip install -r requirements.txt
   mock upstream.
 - `_captured.json` (written by the mock) is how tests assert what the proxy
   actually forwarded; it's gitignored and deleted at the end of the run.
-- Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log` (gitignored).
-- After changing proxy behavior, run `./.venv/bin/python test_proxy.py` and
-  confirm "ALL TESTS PASSED" (212 checks).
+- Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log`, `_proxy5.log`,
+  `_proxy6.log`, `_proxy7.log` (gitignored), plus `_captured_attempts.jsonl` and
+  `_router_*.jsonl` / `_pricing_cache_router_*.json` for section 11.
+- SDK-level retries mask failures: the Portkey/OpenAI clients are built without
+  `max_retries=0`, so 408/429/5xx are retried inside one attempt. Router
+  fallback tests must use **404** to force an immediate failure.
+- After changing proxy behavior, run `./.venv/bin/python test_routing.py`
+  ("ROUTING TESTS PASSED", 86 checks) and `./.venv/bin/python test_proxy.py`
+  ("ALL TESTS PASSED", 250 checks).

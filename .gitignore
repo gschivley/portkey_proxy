@@ -14,3 +14,9 @@ _proxy3.log
 _usage_test.jsonl
 _pricing_cache_test.json
 _proxy4.log
+_captured_attempts.jsonl
+_proxy5.log
+_proxy6.log
+_proxy7.log
+_router_*.jsonl
+_pricing_cache_router_*.json

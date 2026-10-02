@@ -309,6 +309,21 @@ def month_total(month: str) -> float:
     return round(sum(r.get("cost_usd") or 0.0 for r in iter_records(month)), 8)
 
 
+def spent_this_month() -> float:
+    """Recorded spend for the current month, from the cached running total.
+
+    Shares `_MONTH_STATE` with `record()`, so the log is scanned at most once
+    per month per process. Calls still in flight are not counted: this is the
+    figure the router's advisory budget gates are judged against.
+    """
+    month = current_month()
+    with _LOG_LOCK:
+        if _MONTH_STATE["month"] != month:
+            _MONTH_STATE["month"] = month
+            _MONTH_STATE["total"] = month_total(month)
+        return _MONTH_STATE["total"]
+
+
 def _budget_alerts(prev: float, new: float, budget: float) -> List[str]:
     """Warnings for milestones crossed between prev and new monthly spend."""
     alerts: List[str] = []

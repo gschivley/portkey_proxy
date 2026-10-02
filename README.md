@@ -6,6 +6,11 @@ API and translates requests into calls to the official `portkey_ai`
 Python SDK, translating responses (including streaming SSE) back into
 OpenAI JSON/SSE.
 
+Optionally, `ROUTER_ENABLED=1` adds three virtual aliases (`auto-free`,
+`auto-hard`, `auto-review`) that prefer the zero-cost NRP models and reserve the
+paid Portkey models for hard work, with advisory budget gates — see
+[Free-first model router](#free-first-model-router-opt-in).
+
 Exposed models (by default):
 
 | Alias (what Copilot requests) | Upstream model |
@@ -64,6 +69,8 @@ Two NRP quirks are handled transparently:
 - `POST /v1/chat/completions` (also at `/chat/completions`) — OpenAI chat completions, streaming (`"stream": true`) and non-streaming.
 - `POST /v1/responses` (also at `/responses`) — OpenAI Responses API, streaming and non-streaming. See [Completions vs Responses](#completions-vs-responses).
 - `GET /v1/models` (also at `/models`) — lists the available models.
+- `GET /v1/router` (also at `/router`) — live router policy: pools, gates, spend, exhausted scopes (404 when the router is off).
+- `POST /v1/router/reset` (also at `/router/reset`) — clear verified quota-exhaustion markers for this process.
 - `GET /v1/usage` (also at `/usage`) — monthly usage & cost report (`?month=YYYY-MM`).
 - `GET /health`, `GET /` — liveness info.
 
@@ -210,6 +217,113 @@ Bridged requests are logged as `chat request bridged via responses: ...`, so it
 is always visible when this path is taken. Usage and cost tracking are
 unaffected — records still key off the alias you requested.
 
+## Free-first model router (opt-in)
+
+Set `ROUTER_ENABLED=1` to accept three **virtual model aliases** in addition to
+the named models above. The router prefers the zero-cost NRP models and saves
+the paid Portkey models for hard work and reviews, so you can point Copilot at
+one alias instead of choosing per conversation. Everything else about the proxy
+keeps working exactly as before: named models are still served by that model,
+and with the router off (the default) nothing changes at all.
+
+| Alias | Pool used (in order) | For |
+| ------- | ---------------------- | ----- |
+| `auto-free` | free pool, then paid | everyday requests |
+| `auto-hard` | paid pool | difficult tasks |
+| `auto-review` | review pool (default: paid) | code review / final checks |
+
+- **free pool** — `qwen3`, `deepseek-v4-flash`, `glm-5` (zero cost)
+- **paid pool** — every Portkey model in `MODEL_REGISTRY`, registry order
+
+Pools are reconfigured with `ROUTER_FREE_POOL` / `ROUTER_PAID_POOL` /
+`ROUTER_HARD_POOL` / `ROUTER_REVIEW_POOL` (comma-separated aliases) or a
+`ROUTER_CONFIG_PATH` JSON file. `GET /v1/router` shows the live configuration.
+
+### Per-request hints
+
+A client can steer one request without changing the alias it is configured
+with, by adding a `proxy_routing` object (never forwarded upstream):
+
+```json
+{"model": "auto-free",
+ "messages": [...],
+ "proxy_routing": {"task": "hard"}}
+```
+
+| Key | Values | Effect |
+| ----- | -------- | -------- |
+| `task` | `ordinary`, `hard`, `review` | Overrides the alias's pool for this request |
+| `difficulty` | `normal`, `hard` | Same escalation as `task: hard` |
+| `allow_paid` | `false` | Hard "spend nothing" veto: only free models are eligible, even on `auto-hard` |
+| `paid_approved` | `true` | Approves paid use for this request while the approval gate is closed (below) |
+
+Unknown keys are rejected with a 400 (`code: invalid_routing`) rather than
+ignored. `X-Proxy-Model` / `X-Proxy-Route` response headers report which
+concrete model served a virtual alias.
+
+### Capability filtering
+
+A candidate is skipped when it cannot honour the request as sent — the proxy
+never silently drops content or parameters to make a model fit:
+
+- function tools on a model that has none
+- image/audio input on a model declared without it (declare extras in the
+  config file's `capabilities`)
+- Responses-only parameters (`previous_response_id`, `store`, `background`,
+  `include`, `prompt`) and native tool types (`web_search`, `mcp`, `shell`, …)
+  on an NRP model, which is served through the chat bridge
+- `RESPONSES_ENABLED=0` excludes every model from a Responses route
+
+### Bounded fallback
+
+Candidates are tried in order, at most `ROUTER_MAX_ATTEMPTS` (default 3)
+dispatches per request and no new attempt after `ROUTER_DEADLINE_SECONDS`
+(default 120). A 404/408/425/429/5xx, an empty stream, or an upstream
+"unsupported parameter" 400 moves to the next model; an authentication failure
+does not. **Nothing is replayed once bytes have reached the client**: the first
+stream chunk is pulled before the response is committed, and a stream that dies
+mid-body is surfaced as an SSE error frame on the same response.
+
+### Budget gates (advisory)
+
+Spend comes from the same `usage.jsonl` the `/v1/usage` report uses, so no
+second ledger exists. The gates are advisory, and the hard rule is: **money
+never breaks a routed request** — only an explicitly named paid model can be
+refused.
+
+| Recorded monthly spend | `auto-*` route | Explicit paid model |
+| -------------------------- | ---------------- | --------------------- |
+| below `PAID_APPROVAL_THRESHOLD_USD` (230) | paid models allowed | allowed |
+| unknown (usage tracking off / unreadable log) | free models only | 402 `paid_approval_required` unless `paid_approved: true` |
+| at or above 230 | free models only | 402 `paid_approval_required` unless `paid_approved: true` |
+| at or above `MONTHLY_BUDGET_USD` (250) | free models only | 402 `budget_exhausted` |
+| upstream proved the key's quota is spent (402 / `insufficient_quota`) | free models only | 402 `budget_exhausted` |
+
+Verified quota exhaustion is remembered per Portkey key (reported as a hashed
+`exhausted_scopes` entry, never the key itself) for the rest of the calendar
+month, so a dead wallet stops costing round trips; a plain 429 rate limit is
+*not* treated as exhaustion. Clear it with `POST /v1/router/reset`. A request
+already in flight switches to a free model without failing: `auto-hard` whose
+paid model answers 402 is served by the free pool in the same request, and the
+log line reads `router: paid tier unavailable (...); reverting to free models`.
+
+Because spend is read when a request is planned, several concurrent requests
+can each be admitted before any of them is recorded: the caps are advisory, and
+the last requests of a month may overshoot slightly.
+
+### Observability
+
+Every routed request logs one decision line, with no prompt content, no keys,
+and no token counts:
+
+```
+router: alias=auto-free gate=hard hints=task:hard skipped=qwen3(no-tools)
+```
+
+`GET /v1/router` (JSON) and `POST /v1/router/reset` report and clear live
+policy state. `/v1/models` and `/health` advertise the virtual aliases
+alongside the named models.
+
 ## Quick sanity check
 
 ```bash
@@ -290,7 +404,10 @@ Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
   `GPT6_SOL_PRICING_MODEL`) when the catalog renames a deployment.
 - **Budget warnings** are logged by the proxy when the running monthly total
   crosses $50 / $100 / $150 / $200 / $250, and when $25 or $10 remain.
-  Tracking is observe-only: the proxy never rejects a request for budget.
+  Tracking is observe-only: the proxy never rejects a request for budget —
+  unless you turn on the [free-first router](#free-first-model-router-opt-in),
+  which reuses this log as its spend source and applies the approval / cap
+  gates described there.
 - **Reports:**
 
 ```bash
@@ -308,11 +425,19 @@ freely (a month's totals are always recomputed from the records present).
 
 ## Tests
 
-Runs the proxy against a mock upstream (no real key needed):
+Two suites, both against a mock upstream (no real key needed):
 
 ```bash
-./.venv/bin/python test_proxy.py
+./.venv/bin/python test_routing.py   # 86 checks: router policy in isolation
+./.venv/bin/python test_proxy.py     # 250 checks: end-to-end, incl. the router
 ```
+
+`test_routing.py` exercises `routing.py` directly (pools, hints, capability
+filtering, gates, exhaustion, config). Section 11 of `test_proxy.py` boots three
+router proxies in different budget states and drives them over HTTP, including
+the fallback ladder, mid-stream breaks, and the paid→free revert. Neither suite
+uses pytest; each is a single script that prints `ALL TESTS PASSED` /
+`ROUTING TESTS PASSED`.
 
 ## Troubleshooting
 
