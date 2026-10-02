@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -271,22 +272,31 @@ def compute_cost(rates: Dict[str, float], tokens: Dict[str, int]) -> float:
 _LOG_LOCK = threading.Lock()
 # Running total for the current month, kept in memory; re-derived from the
 # log whenever the process starts up in or rolls into a new month.
-_MONTH_STATE: Dict[str, Any] = {"month": None, "total": 0.0}
+_MONTH_STATE: Dict[str, Any] = {
+    "month": None, "total": 0.0, "unpriced": 0, "readable": False,
+    "unlogged": False, "unlogged_cost": 0.0, "unlogged_unpriced": 0,
+}
 
 
-def _append_line(record: Dict[str, Any]) -> None:
+def _append_line(record: Dict[str, Any]) -> bool:
     try:
         with USAGE_LOG_PATH.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        return True
     except OSError as exc:
         log.warning("could not append to usage log %s: %s", USAGE_LOG_PATH, exc)
+        return False
 
 
-def iter_records(month: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Read the usage log (optionally filtered to one 'YYYY-MM' bucket)."""
+def iter_records(month: Optional[str] = None, *, strict: bool = False) -> List[Dict[str, Any]]:
+    """Read JSONL; budget readers fail closed, reports tolerate damaged logs."""
     try:
         lines = USAGE_LOG_PATH.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeError):
+        if strict:
+            raise
         return []
     out: List[Dict[str, Any]] = []
     for line in lines:
@@ -296,8 +306,12 @@ def iter_records(month: Optional[str] = None) -> List[Dict[str, Any]]:
         try:
             rec = json.loads(line)
         except ValueError:
+            if strict:
+                raise ValueError("usage log contains invalid JSON")
             continue
-        if not isinstance(rec, dict):
+        if not isinstance(rec, dict) or not isinstance(rec.get("month"), str):
+            if strict:
+                raise ValueError("usage log contains an invalid record")
             continue
         if month is not None and rec.get("month") != month:
             continue
@@ -309,19 +323,55 @@ def month_total(month: str) -> float:
     return round(sum(r.get("cost_usd") or 0.0 for r in iter_records(month)), 8)
 
 
-def spent_this_month() -> float:
-    """Recorded spend for the current month, from the cached running total.
+def _refresh_month(month: str) -> None:
+    """Refresh under _LOG_LOCK; unsuccessful reads must remain retryable."""
+    if _MONTH_STATE["month"] != month:
+        _MONTH_STATE.update(
+            month=month, total=0.0, unpriced=0, readable=False,
+            unlogged=False, unlogged_cost=0.0, unlogged_unpriced=0,
+        )
+    if _MONTH_STATE["readable"]:
+        return
+    try:
+        records = iter_records(month, strict=True)
+    except (OSError, UnicodeError, ValueError) as exc:
+        log.warning("could not read monthly spend from %s: %s", USAGE_LOG_PATH, exc)
+        return
+    total = 0.0
+    unpriced = 0
+    for rec in records:
+        cost = rec.get("cost_usd")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
+            total += cost
+        else:
+            unpriced += 1
+    # Failed appends are absent from the ledger but still count in this process.
+    _MONTH_STATE["total"] = round(total + _MONTH_STATE["unlogged_cost"], 8)
+    _MONTH_STATE["unpriced"] = unpriced + _MONTH_STATE["unlogged_unpriced"]
+    _MONTH_STATE["readable"] = True
 
-    Shares `_MONTH_STATE` with `record()`, so the log is scanned at most once
-    per month per process. Calls still in flight are not counted: this is the
-    figure the router's advisory budget gates are judged against.
+
+def spend_snapshot() -> Dict[str, Any]:
+    """Known subtotal plus uncertainty, sharing record()'s monthly cache.
+
+    Successful logs are scanned once per month; failed reads are retried. An
+    unknown-priced or unlogged call makes total spend unknown, but does not
+    erase the known subtotal (which may already prove the cap was reached).
     """
-    month = current_month()
     with _LOG_LOCK:
-        if _MONTH_STATE["month"] != month:
-            _MONTH_STATE["month"] = month
-            _MONTH_STATE["total"] = month_total(month)
-        return _MONTH_STATE["total"]
+        _refresh_month(current_month())
+        known = _MONTH_STATE["total"]
+        complete = _MONTH_STATE["readable"] and not _MONTH_STATE["unlogged"] and not _MONTH_STATE["unpriced"]
+        return {
+            "spend_usd": known if complete else None,
+            "known_spend_usd": known,
+            "requests_without_pricing": _MONTH_STATE["unpriced"],
+        }
+
+
+def spent_this_month() -> Optional[float]:
+    """Recorded monthly spend, or None when the ledger cannot establish it."""
+    return spend_snapshot()["spend_usd"]
 
 
 def _budget_alerts(prev: float, new: float, budget: float) -> List[str]:
@@ -390,14 +440,18 @@ def record(
     }
     with _LOG_LOCK:
         month = record_line["month"]
-        if _MONTH_STATE["month"] != month:
-            # Cold start (or new month): derive the running total from the log.
-            _MONTH_STATE["month"] = month
-            _MONTH_STATE["total"] = month_total(month)
+        _refresh_month(month)
         prev = _MONTH_STATE["total"]
-        _append_line(record_line)
+        if not _append_line(record_line):
+            _MONTH_STATE["unlogged"] = True
+            if cost is None:
+                _MONTH_STATE["unlogged_unpriced"] += 1
+            else:
+                _MONTH_STATE["unlogged_cost"] += cost
         if cost is not None:
             _MONTH_STATE["total"] = round(prev + cost, 8)
+        else:
+            _MONTH_STATE["unpriced"] += 1
         new = _MONTH_STATE["total"]
         for alert in _budget_alerts(prev, new, MONTHLY_BUDGET_USD):
             log.warning(alert)

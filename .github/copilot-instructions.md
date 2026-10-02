@@ -22,10 +22,10 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the router policy unit suite (86 checks; no server needed)
+# Run the router policy + spend-reader unit suite (170 checks; no server needed)
 ./.venv/bin/python test_routing.py
 
-# Run the full integration test suite (250 checks; boots a mock upstream + the real proxy)
+# Run the integration + controlled-stream suite (342 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -49,8 +49,9 @@ pip install -r requirements.txt
   `mark_exhausted()` track verified Portkey quota exhaustion (keyed by a SHA-256
   hash of the API key, never the key itself) and `is_quota_exhaustion()` decides
   whether an upstream error proves the wallet is spent; `status()` backs
-  `GET /v1/router`. Spend is read lazily through an injected `spend_provider`
-  (default `usage.spent_this_month`) and cached per calendar month.
+  `GET /v1/router`. Spend is read lazily through an injected `spend_func`
+  or the default `usage.spend_snapshot`, sharing the usage module's monthly
+  cache and known-subtotal/unknown-cost state.
 - `usage.py` — usage & cost tracking (imported by `proxy.py` and `usage_report.py`).
   Reads its config at import time (after `.env` loading). `PricingCache` fetches
   `GET {PRICING_BASE_URL}/pricing/<provider>/<model>` (public Portkey API) with a
@@ -214,14 +215,22 @@ pip install -r requirements.txt
   spend is unknown, e.g. `USAGE_TRACKING=0` — and 402 `budget_exhausted` at
   `MONTHLY_BUDGET_USD` or once a scope is verified exhausted). In-flight
   exhaustion reverts to free models inside the same request
-  (`Plan.free_fallback`). Every `routing_mod.RoutingError` escaping into a route
+  (`Plan.free_fallback`), sharing the original attempt count/deadline (default
+  4 dispatches). Approval never bypasses the cap. Explicit paid failures also
+  mark exhausted scopes, without substituting models. Missing prices and failed
+  log reads/writes make spend unknown; the known subtotal still enforces the cap.
+  Empty JSON pools and a zero approval threshold remain explicit; invalid policy
+  types/limits fail startup. Mandatory bridge-fidelity exclusions cannot be
+  overridden by config. Every `routing_mod.RoutingError` escaping into a route
   must be translated to `ApiError`; the catch-all handler would return a 500 and
   reset the keep-alive connection, producing a misleading `httpx.ReadError` on
   the *next* request.
 - **Errors are OpenAI-shaped**: `ApiError` + `_exception_details` map SDK
   exception class names (e.g. `RateLimitError` → 429) to
   `{"error": {message, type, param, code}}`. Streaming errors are emitted as SSE
-  error frames followed by `[DONE]`.
+  error frames followed by `[DONE]` for chat; Responses uses typed `error`
+  events without `[DONE]`. Routed streams must produce real upstream data before
+  synthetic bridge frames can commit a response; an empty stream is rewindable.
 - **Streaming**: `_sse_stream` re-emits SDK chunks as SSE; `data["model"]` is
   always rewritten to the alias; `INCLUDE_STREAM_USAGE=1` adds
   `stream_options.include_usage` so the final chunk carries usage.
@@ -260,5 +269,5 @@ pip install -r requirements.txt
   `max_retries=0`, so 408/429/5xx are retried inside one attempt. Router
   fallback tests must use **404** to force an immediate failure.
 - After changing proxy behavior, run `./.venv/bin/python test_routing.py`
-  ("ROUTING TESTS PASSED", 86 checks) and `./.venv/bin/python test_proxy.py`
-  ("ALL TESTS PASSED", 250 checks).
+  ("ROUTING TESTS PASSED", 170 checks) and `./.venv/bin/python test_proxy.py`
+  ("ALL TESTS PASSED", 342 checks).

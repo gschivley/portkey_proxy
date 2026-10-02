@@ -39,15 +39,15 @@ Configuration (environment / .env):
     ROUTER_PAID_POOL               comma-separated paid aliases
     ROUTER_HARD_POOL               pool for hard tasks (default: paid pool)
     ROUTER_REVIEW_POOL             pool for reviews (default: paid pool)
-    ROUTER_MAX_ATTEMPTS            upstream dispatches per request (default 3)
+    ROUTER_MAX_ATTEMPTS            upstream dispatches per request (default 4)
     ROUTER_DEADLINE_SECONDS        stop starting attempts after this (default 120)
     PAID_APPROVAL_THRESHOLD_USD    approval gate (default 230)
 
 JSON config file (all keys optional):
     {"pools": {"free": [...], "paid": [...], "hard": [...], "review": [...]},
-     "capabilities": {"qwen3": {"image_input": true}},
+     "capabilities": {"qwen3": {"image": false}},
      "native_only_params": ["previous_response_id", "store", ...],
-     "max_attempts": 3,
+     "max_attempts": 4,
      "paid_approval_threshold_usd": 230,
      "monthly_budget_usd": 250}
 """
@@ -57,6 +57,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -84,18 +85,12 @@ DEFAULT_NATIVE_ONLY_PARAMS = (
     "background",
     "include",
     "prompt",
-)
-
-# tool_choice / tool types that only exist on the Responses API.
-_NATIVE_TOOL_TYPES = (
-    "shell",
-    "custom",
-    "file_search",
-    "web_search_preview",
-    "web_search",
-    "code_interpreter",
-    "computer_use",
-    "mcp",
+    "prompt_cache_key",
+    "safety_identifier",
+    "service_tier",
+    "truncation",
+    "max_tool_output_tokens",
+    "top_logprobs",
 )
 
 _TRUE = ("1", "true", "yes", "on")
@@ -109,7 +104,7 @@ def _flag(name: str, default: bool = False) -> bool:
 
 
 def _first_set(*values: Any) -> Any:
-    """First value that is explicitly provided (0 and "" count as absent)."""
+    """First provided value; zero is explicit, blank environment strings are not."""
     for value in values:
         if value is None:
             continue
@@ -117,18 +112,6 @@ def _first_set(*values: Any) -> Any:
             continue
         return value
     return values[-1]
-
-
-def _float_env(name: str, default: float) -> float:
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        log.warning("invalid %s=%r; using %.2f", name, raw, default)
-        return default
-    return value
 
 
 def is_enabled() -> bool:
@@ -275,12 +258,96 @@ def _has_tools(value: Any) -> bool:
 
 def _native_tool_used(body: Dict[str, Any]) -> bool:
     for tool in body.get("tools") or []:
-        if isinstance(tool, dict) and str(tool.get("type")) in _NATIVE_TOOL_TYPES:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
             return True
     choice = body.get("tool_choice")
-    if isinstance(choice, dict) and str(choice.get("type")) in _NATIVE_TOOL_TYPES:
+    return isinstance(choice, dict) and choice.get("type") != "function"
+
+
+def _bridge_input_supported(inp: Any) -> bool:
+    """Match the lossless subset of the Responses-to-chat input translator."""
+    if inp is None or isinstance(inp, str):
         return True
-    return False
+    if not isinstance(inp, list):
+        return False
+    for item in inp:
+        if isinstance(item, str):
+            continue
+        if not isinstance(item, dict):
+            return False
+        kind = item.get("type")
+        if kind in (None, "message"):
+            if set(item) - {"type", "role", "content", "id", "status"}:
+                return False
+            content = item.get("content")
+            if isinstance(content, str):
+                continue
+            if not isinstance(content, list):
+                return False
+            allowed = {
+                "input_text": {"type", "text"},
+                "output_text": {"type", "text"},
+                "text": {"type", "text"},
+                "refusal": {"type", "refusal"},
+                "input_image": {"type", "image_url", "image"},
+                "image_url": {"type", "image_url"},
+                "input_audio": {"type", "input_audio", "audio"},
+                "audio": {"type", "audio"},
+            }
+            for part in content:
+                if not isinstance(part, dict):
+                    return False
+                keys = allowed.get(part.get("type"))
+                if keys is None or set(part) - keys:
+                    return False
+        elif kind == "function_call":
+            if set(item) - {"type", "id", "status", "call_id", "name", "arguments"}:
+                return False
+        elif kind == "function_call_output":
+            if (
+                set(item) - {"type", "id", "status", "call_id", "name", "output"}
+                or not isinstance(item.get("output"), str)
+            ):
+                return False
+        else:
+            return False
+    return True
+
+
+def _bridge_option_losses(body: Dict[str, Any]) -> List[str]:
+    losses: List[str] = []
+    if not _bridge_input_supported(body.get("input")):
+        losses.append("input")
+    if body.get("instructions") is not None and not isinstance(body["instructions"], str):
+        losses.append("instructions")
+    reasoning = body.get("reasoning")
+    if reasoning is not None and (
+        not isinstance(reasoning, dict)
+        or set(reasoning) - {"effort"}
+        or reasoning.get("effort") == "none"
+    ):
+        losses.append("reasoning")
+    text = body.get("text")
+    if text is not None:
+        fmt = text.get("format", {}) if isinstance(text, dict) else None
+        if (
+            not isinstance(text, dict)
+            or set(text) - {"format"}
+            or not isinstance(fmt, dict)
+            or fmt.get("type", "text") not in ("text", "json_object")
+            or (fmt.get("type", "text") == "text" and set(fmt) - {"type"})
+        ):
+            losses.append("text")
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict) and choice.get("type") == "function" and set(choice) - {"type", "name"}:
+        losses.append("tool_choice")
+    metadata = body.get("metadata")
+    if metadata is not None and (
+        not isinstance(metadata, dict)
+        or any(not isinstance(value, str) for value in metadata.values())
+    ):
+        losses.append("metadata")
+    return losses
 
 
 def request_requirements(
@@ -301,7 +368,8 @@ def request_requirements(
             for key in native_only_params
             if key in body and _is_requested(body.get(key))
         ]
-        if "previous_response_id" in body:
+        reqs["native_only"].extend(_bridge_option_losses(body))
+        if body.get("previous_response_id"):
             reqs["stateful"] = True
         if _native_tool_used(body):
             reqs["native_tools"] = True
@@ -413,38 +481,53 @@ class Router:
     ) -> None:
         self.registry = registry
         self.responses_enabled = responses_enabled
+        for name, value in (
+            ("max_attempts", max_attempts), ("deadline_seconds", deadline_seconds),
+            ("paid_approval_threshold_usd", approval_threshold_usd), ("monthly_budget_usd", monthly_budget_usd),
+        ):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+                raise ValueError(f"router {name} must be a number")
         self.config = self._load_config(config_path, config)
-        pools = self.config.get("pools") or {}
-        paid_pool = list(
-            pools.get("paid") or _pool_env("ROUTER_PAID_POOL", self._default_paid_pool())
-        )
+        for key in ("max_attempts", "deadline_seconds", "paid_approval_threshold_usd", "monthly_budget_usd"):
+            if key in self.config and (
+                isinstance(self.config[key], bool) or not isinstance(self.config[key], (int, float))
+            ):
+                raise ValueError(f"router {key} must be a number")
+        pools = self.config.get("pools", {})
+        if not isinstance(pools, dict) or set(pools) - {"free", "paid", "hard", "review"}:
+            raise ValueError("router pools must be an object with free/paid/hard/review lists")
+
+        def pool(name: str, default: Any) -> List[str]:
+            value = pools[name] if name in pools else _pool_env(f"ROUTER_{name.upper()}_POOL", default)
+            if not isinstance(value, list) or any(not isinstance(alias, str) or not alias.strip() for alias in value):
+                raise ValueError(f"router pools.{name} must be a list of non-empty model names")
+            return list(value)
+
+        paid_pool = pool("paid", self._default_paid_pool())
         self.pools: Dict[str, List[str]] = {
-            "free": list(
-                pools.get("free") or _pool_env("ROUTER_FREE_POOL", DEFAULT_FREE_POOL)
-            ),
+            "free": pool("free", DEFAULT_FREE_POOL),
             "paid": paid_pool,
-            "hard": list(pools.get("hard") or _pool_env("ROUTER_HARD_POOL", paid_pool)),
-            "review": list(
-                pools.get("review") or _pool_env("ROUTER_REVIEW_POOL", paid_pool)
-            ),
+            "hard": pool("hard", paid_pool),
+            "review": pool("review", paid_pool),
         }
-        self.capabilities: Dict[str, Dict[str, Any]] = dict(
-            self.config.get("capabilities") or {}
+        self.capabilities = self.config.get("capabilities", {})
+        if not isinstance(self.capabilities, dict) or any(
+            not isinstance(caps, dict)
+            or any(value is not None and not isinstance(value, bool) for value in caps.values())
+            for caps in self.capabilities.values()
+        ):
+            raise ValueError("router capabilities must map model names to boolean flags")
+        native = self.config.get("native_only_params", [])
+        if not isinstance(native, list) or any(not isinstance(key, str) or not key for key in native):
+            raise ValueError("native_only_params must be a list of parameter names")
+        self.native_only_params = tuple(dict.fromkeys((*DEFAULT_NATIVE_ONLY_PARAMS, *native)))
+        attempts = _first_set(
+            max_attempts, self.config.get("max_attempts"),
+            os.environ.get("ROUTER_MAX_ATTEMPTS"), 4,
         )
-        native = self.config.get("native_only_params")
-        self.native_only_params: Tuple[str, ...] = (
-            tuple(native) if isinstance(native, list) else DEFAULT_NATIVE_ONLY_PARAMS
-        )
-        self.max_attempts = int(
-            _first_set(
-                max_attempts,
-                self.config.get("max_attempts"),
-                os.environ.get("ROUTER_MAX_ATTEMPTS"),
-                3,
-            )
-        )
-        if self.max_attempts < 1:
-            raise ValueError("ROUTER_MAX_ATTEMPTS must be >= 1")
+        if isinstance(attempts, bool) or not float(attempts).is_integer() or float(attempts) < 1:
+            raise ValueError("ROUTER_MAX_ATTEMPTS must be an integer >= 1")
+        self.max_attempts = int(attempts)
         self.deadline_seconds = float(
             _first_set(
                 deadline_seconds,
@@ -453,20 +536,21 @@ class Router:
                 120,
             )
         )
-        if self.deadline_seconds <= 0:
-            raise ValueError("ROUTER_DEADLINE_SECONDS must be > 0")
-        self.approval_threshold_usd = float(
-            approval_threshold_usd
-            if approval_threshold_usd is not None
-            else self.config.get("paid_approval_threshold_usd")
-            or _float_env("PAID_APPROVAL_THRESHOLD_USD", 230.0)
-        )
-        self.monthly_budget_usd = float(
-            monthly_budget_usd
-            if monthly_budget_usd is not None
-            else self.config.get("monthly_budget_usd")
-            or usage_mod.MONTHLY_BUDGET_USD
-        )
+        if not math.isfinite(self.deadline_seconds) or self.deadline_seconds <= 0:
+            raise ValueError("ROUTER_DEADLINE_SECONDS must be finite and > 0")
+        self.approval_threshold_usd = float(_first_set(
+            approval_threshold_usd, self.config.get("paid_approval_threshold_usd"),
+            os.environ.get("PAID_APPROVAL_THRESHOLD_USD"), 230.0,
+        ))
+        self.monthly_budget_usd = float(_first_set(
+            monthly_budget_usd, self.config.get("monthly_budget_usd"), usage_mod.MONTHLY_BUDGET_USD,
+        ))
+        for name, value in (
+            ("PAID_APPROVAL_THRESHOLD_USD", self.approval_threshold_usd),
+            ("MONTHLY_BUDGET_USD", self.monthly_budget_usd),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and >= 0")
         if self.approval_threshold_usd >= self.monthly_budget_usd and self.monthly_budget_usd > 0:
             raise ValueError(
                 "PAID_APPROVAL_THRESHOLD_USD "
@@ -546,7 +630,8 @@ class Router:
         """
         if self._spend_explicit:
             try:
-                return float(self._spend())
+                value = self._spend()
+                return float(value) if value is not None and math.isfinite(value) and value >= 0 else None
             except Exception:  # noqa: BLE001 - spend is advisory, never fatal
                 log.exception("router: could not read monthly spend")
                 return None
@@ -558,23 +643,26 @@ class Router:
                     "read; paid requests will require explicit approval."
                 )
             return None
-        try:
-            return float(self._spend())
-        except Exception:  # noqa: BLE001 - spend is advisory, never fatal
-            log.exception("router: could not read monthly spend")
-            return None
+        return usage_mod.spent_this_month()
 
     def spend_state(self) -> Dict[str, Any]:
-        spend = self.spend()
+        if not self._spend_explicit and usage_mod.USAGE_TRACKING:
+            snapshot = usage_mod.spend_snapshot()
+            spend = snapshot["spend_usd"]
+            known = snapshot["known_spend_usd"]
+        else:
+            spend = self.spend()
+            known = spend
         return {
             "spend_usd": spend,
+            "known_spend_usd": known,
             "approval_threshold_usd": self.approval_threshold_usd,
             "monthly_budget_usd": self.monthly_budget_usd,
             "approval_required": spend is None or spend >= self.approval_threshold_usd,
             "budget_exhausted": (
-                spend is not None
+                known is not None
                 and self.monthly_budget_usd > 0
-                and spend >= self.monthly_budget_usd
+                and known >= self.monthly_budget_usd
             ),
             "month": self._month(),
         }
@@ -702,13 +790,12 @@ class Router:
             if portkey_scope and portkey_scope in exhausted:
                 skipped.append((alias, "exhausted"))
                 continue
-            if not approved:
-                if state["budget_exhausted"]:
-                    skipped.append((alias, "over-budget"))
-                    continue
-                if state["approval_required"]:
-                    skipped.append((alias, "approval-required"))
-                    continue
+            if state["budget_exhausted"]:
+                skipped.append((alias, "over-budget"))
+                continue
+            if not approved and state["approval_required"]:
+                skipped.append((alias, "approval-required"))
+                continue
             out.append(alias)
         return out, skipped
 
@@ -719,7 +806,7 @@ class Router:
                 return "responses-disabled"
             if not caps["responses_native"] and not caps["responses_bridged"]:
                 return "no-responses"
-            if not caps["responses_native"]:
+            if self.registry[alias].get("responses_via_chat") or not caps["responses_native"]:
                 if reqs.get("native_only"):
                     return "native-param:" + ",".join(reqs["native_only"])
                 if reqs.get("native_tools"):
@@ -757,7 +844,7 @@ class Router:
         spend = state["spend_usd"]
         if reason in ("over-budget", "exhausted"):
             detail = (
-                f"${spend:.2f} of the ${state['monthly_budget_usd']:.2f} monthly "
+                f"${state['known_spend_usd']:.2f} of the ${state['monthly_budget_usd']:.2f} monthly "
                 "budget is already recorded"
                 if reason == "over-budget"
                 else "the upstream reported this API key's quota as exhausted"
@@ -1009,7 +1096,6 @@ class Router:
 
 _EXHAUSTION_PATTERNS = (
     r"insufficient[_ ]quota",
-    r"quota[_ ]exceeded",
     r"exceeded[_ ]your[_ ](current[_ ])?quota",
     r"budget[_ ](has[_ ]been[_ ])?exhausted",
     r"spending[_ ](limit|cap)",
@@ -1031,8 +1117,15 @@ def is_quota_exhaustion(
     than evidence of exhausted spend. A 402, or a quota/budget phrasing that the
     upstream attaches to any status, counts as exhaustion.
     """
+    if status in (401, 403):
+        return False
     if status == 402:
         return True
+    if code == "insufficient_quota":
+        return True
+    # Generic quota errors also describe short-lived token/request limits.
+    if re.search(r"rate[_ ]limit|per (second|minute|hour)|retry[_ -]?after|requests? per|tokens? per", message or "", re.IGNORECASE):
+        return False
     if code and _EXHAUSTION_RE.search(str(code)):
         return True
     return bool(_EXHAUSTION_RE.search(message or ""))

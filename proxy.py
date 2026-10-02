@@ -101,7 +101,7 @@ Free-first routing (see routing.py; opt-in, GET /v1/router):
     ROUTER_PAID_POOL         paid (Portkey) aliases, in order
     ROUTER_HARD_POOL         pool for hard tasks (default: paid pool)
     ROUTER_REVIEW_POOL       pool for review tasks (default: paid pool)
-    ROUTER_MAX_ATTEMPTS      upstream dispatches per request (default 3)
+    ROUTER_MAX_ATTEMPTS      upstream dispatches per request (default 4)
     ROUTER_DEADLINE_SECONDS  stop starting new attempts after this long
                              (default 120)
     PAID_APPROVAL_THRESHOLD_USD
@@ -595,6 +595,8 @@ def _exception_details(
 ) -> Tuple[int, str, str, Optional[str], Optional[str]]:
     """Map SDK/HTTP exceptions onto (status, message, type, code, param)."""
     name = type(exc).__name__
+    if name == "_AttemptFailure":
+        return exc.status_code, str(exc), exc.err_type, exc.code, exc.param
     status_map = {
         "AuthenticationError": (401, "authentication_error"),
         "PermissionDeniedError": (403, "permission_error"),
@@ -2086,13 +2088,16 @@ class _AttemptFailure(Exception):
             content=_error_payload(str(self), self.err_type, self.code, self.param),
         )
 
-    def as_sse(self) -> StreamingResponse:
-        """The error stream a non-routed request would have produced."""
-        payload = _error_payload(str(self), self.err_type, self.code, self.param)[
-            "error"
-        ]
+    def as_sse(self, wire: str = "chat") -> StreamingResponse:
+        """Serialize a terminal failure in the caller's wire protocol."""
+        payload = _error_payload(str(self), self.err_type, self.code, self.param)["error"]
+        frames = (
+            [sse_event_frame({"type": "error", "message": str(self), "code": self.code, "param": self.param})]
+            if wire == "responses"
+            else [sse_frame({"error": payload}), "data: [DONE]\n\n"]
+        )
         return StreamingResponse(
-            iter([sse_frame({"error": payload}), "data: [DONE]\n\n"]),
+            iter(frames),
             media_type="text/event-stream",
             headers=sse_headers(),
         )
@@ -2388,11 +2393,48 @@ async def _prime_stream(frames: Any) -> Tuple[Optional[str], Optional[_AttemptFa
 
 
 def _frames_with_head(head: str, rest: Any) -> Generator[str, None, None]:
-    yield head
-    yield from rest
+    try:
+        yield head
+        yield from rest
+    finally:
+        _close_stream(rest)
 
 
-async def _run_routed(route: _Route, dispatch: Any, *, stream: bool) -> Response:
+def _close_stream(stream: Any) -> None:
+    close = getattr(stream, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            logging.warning("Could not close upstream stream", exc_info=True)
+
+
+def _payload_failure(data: Dict[str, Any], status: int = 502) -> Optional[_AttemptFailure]:
+    error = data.get("error")
+    if data.get("type") == "error":
+        error = data
+    elif data.get("type") == "response.failed":
+        error = (data.get("response") or {}).get("error")
+    if not isinstance(error, dict):
+        return None
+    return _AttemptFailure(
+        status, str(error.get("message") or "Upstream stream failed."),
+        str(error.get("type") or "api_error"), error.get("code"), error.get("param"),
+    )
+
+
+def _observe_route_response(route: _Route, cand: _Candidate, response: Response) -> Response:
+    """Observe explicit failures and committed stream errors without replay."""
+    if ROUTER is None or cand.source != "portkey" or isinstance(response, StreamingResponse):
+        return response
+    if response.status_code >= 400:
+        failure = _payload_failure(json.loads(response.body), response.status_code)
+        if failure:
+            _note_route_failure(route, cand, failure)
+    return response
+
+
+async def _run_routed(route: _Route, dispatch: Any, *, stream: bool, wire: str = "chat") -> Response:
     """Try the route's candidates in order, at most max_attempts times.
 
     `dispatch(cand, headers)` returns a committed Response or raises
@@ -2402,12 +2444,17 @@ async def _run_routed(route: _Route, dispatch: Any, *, stream: bool) -> Response
     """
     assert ROUTER is not None
     started = time.monotonic()
-    limit = min(len(route.candidates), max(1, ROUTER.max_attempts))
+    limit = ROUTER.max_attempts
     exhausted_scope = route.scope or ROUTER.scope(None, "portkey")
     last_failure: Optional[_AttemptFailure] = None
     tried = 0
-    for cand in route.candidates:
+    candidates = list(route.candidates)
+    fallback_added = False
+    for cand in candidates:
         if tried >= limit:
+            break
+        if time.monotonic() - started >= ROUTER.deadline_seconds:
+            logging.warning("router: deadline exceeded after %d attempt(s)", tried)
             break
         if cand.source == "portkey" and ROUTER.scope_exhausted(exhausted_scope):
             # The paid wallet is empty: don't burn another round trip on it.
@@ -2417,17 +2464,14 @@ async def _run_routed(route: _Route, dispatch: Any, *, stream: bool) -> Response
                 "monthly quota is exhausted.",
                 code="budget_exhausted",
             )
+            if not fallback_added:
+                candidates.extend(route.free_fallback)
+                fallback_added = True
             continue
-        if tried and (time.monotonic() - started) > ROUTER.deadline_seconds:
-            logging.warning(
-                "router: %ss deadline exceeded after %d attempt(s)",
-                ROUTER.deadline_seconds,
-                tried,
-            )
-            break
         tried += 1
         try:
-            return await dispatch(cand, route_headers(route, cand))
+            response = await dispatch(cand, route_headers(route, cand))
+            return _observe_route_response(route, cand, response)
         except ApiError as exc:
             failure = _AttemptFailure.from_api_error(exc)
         except _AttemptFailure as exc:
@@ -2436,37 +2480,22 @@ async def _run_routed(route: _Route, dispatch: Any, *, stream: bool) -> Response
         _note_route_failure(route, cand, failure)
         if not failure.retryable:
             break
+        if cand.source == "portkey" and failure.policy and not fallback_added:
+            candidates.extend(route.free_fallback)
+            fallback_added = True
         logging.warning(
             "router: model=%s failed (status=%s): %s",
             cand.alias,
             failure.status_code,
             str(failure)[:300],
         )
-    if (
-        last_failure is not None
-        and last_failure.policy
-        and route.free_fallback
-        and (time.monotonic() - started) <= ROUTER.deadline_seconds
-    ):
-        logging.warning(
-            "router: paid tier unavailable (%s); reverting to free models",
-            str(last_failure)[:200],
-        )
-        for cand in route.free_fallback[: ROUTER.max_attempts]:
-            try:
-                return await dispatch(cand, route_headers(route, cand))
-            except ApiError as exc:
-                last_failure = _AttemptFailure.from_api_error(exc)
-            except _AttemptFailure as exc:
-                last_failure = exc
-            _note_route_failure(route, cand, last_failure)
     if last_failure is None:
         raise ApiError(
             400,
             "The router found no model eligible to serve this request.",
             code="no_eligible_model",
         )
-    return last_failure.as_sse() if stream else last_failure.as_json()
+    return last_failure.as_sse(wire) if stream else last_failure.as_json()
 
 
 # ----------------------------- chat completions ---------------------------- #
@@ -2478,6 +2507,7 @@ def _sse_stream(
     alias: str,
     attempts: List[Dict[str, Any]],
     surface_errors: bool = False,
+    failure_callback: Any = None,
 ) -> Generator[str, None, None]:
     """Run the SDK stream and re-emit OpenAI SSE chunks.
 
@@ -2492,13 +2522,17 @@ def _sse_stream(
     """
     yielded_any = False
     recorded_usage = False
+    stream = None
     try:
         stream = client.chat.completions.create(
             model=upstream, stream=True, **attempts[0]
         )
         for chunk in stream:
-            yielded_any = True
             data = to_json_dict(chunk)
+            failure = _payload_failure(data)
+            if failure:
+                raise failure
+            yielded_any = True
             data["model"] = alias  # report the name the client asked for
             if (
                 not recorded_usage
@@ -2508,6 +2542,8 @@ def _sse_stream(
                 recorded_usage = True
                 _track_usage(alias, data["usage"], stream=True)
             yield sse_frame(data)
+        if surface_errors and not yielded_any:
+            raise _AttemptFailure(502, "Upstream returned an empty stream.")
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
         status, message, err_type, code, param = _exception_details(exc)
         if (
@@ -2521,11 +2557,13 @@ def _sse_stream(
                 _reasoning_desc(attempts[1]),
             )
             yield from _sse_stream(
-                client, upstream, alias, attempts[1:], surface_errors
+                client, upstream, alias, attempts[1:], surface_errors, failure_callback
             )
             return
         if surface_errors and not yielded_any:
             raise _AttemptFailure(status, message, err_type, code, param)
+        if failure_callback:
+            failure_callback(_AttemptFailure(status, message, err_type, code, param))
         if status >= 500:
             logging.exception("Upstream stream failed (status=%s)", status)
         else:
@@ -2533,6 +2571,8 @@ def _sse_stream(
         yield sse_frame(
             {"error": _error_payload(message, err_type, code, param)["error"]}
         )
+    finally:
+        _close_stream(stream)
     yield "data: [DONE]\n\n"
 
 
@@ -2559,6 +2599,7 @@ def _sse_bridged_stream(
     alias: str,
     kwargs: Dict[str, Any],
     surface_errors: bool = False,
+    failure_callback: Any = None,
 ) -> Generator[str, None, None]:
     """Stream the Responses API and re-emit chat-completion SSE chunks.
 
@@ -2570,10 +2611,14 @@ def _sse_bridged_stream(
     translator = _ResponsesToChatSSE(alias)
     recorded_usage = False
     yielded_any = False
+    stream = None
     try:
         stream = client.responses.create(model=upstream, stream=True, **kwargs)
         for event in stream:
             data = to_json_dict(event)
+            failure = _payload_failure(data)
+            if failure:
+                raise failure
             if not recorded_usage:
                 usage: Any = data.get("usage")
                 if not isinstance(usage, dict) or not usage:
@@ -2586,10 +2631,14 @@ def _sse_bridged_stream(
             for frame in translator.consume(data):
                 yielded_any = True
                 yield frame
+        if surface_errors and not yielded_any:
+            raise _AttemptFailure(502, "Upstream returned an empty stream.")
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
         status, message, err_type, code, param = _exception_details(exc)
         if surface_errors and not yielded_any:
             raise _AttemptFailure(status, message, err_type, code, param)
+        if failure_callback:
+            failure_callback(_AttemptFailure(status, message, err_type, code, param))
         if status >= 500:
             logging.exception("Bridged responses stream failed (status=%s)", status)
         else:
@@ -2601,6 +2650,8 @@ def _sse_bridged_stream(
         )
         yield "data: [DONE]\n\n"
         return
+    finally:
+        _close_stream(stream)
     for frame in translator.finish():
         yield frame
 
@@ -2611,6 +2662,7 @@ async def _dispatch_chat(
     extra_headers: Optional[Dict[str, str]] = None,
     *,
     surface_errors: bool = False,
+    failure_callback: Any = None,
 ) -> Response:
     """Send one chat-completions request to one concrete model.
 
@@ -2677,7 +2729,7 @@ async def _dispatch_chat(
                 _responses_to_chat_completion(raw, alias), headers=extra_headers
             )
         frames = _sse_bridged_stream(
-            client, upstream, alias, resp_kwargs, surface_errors
+            client, upstream, alias, resp_kwargs, surface_errors, failure_callback
         )
         if surface_errors:
             first, failure = await _prime_stream(frames)
@@ -2757,7 +2809,7 @@ async def _dispatch_chat(
     # Streaming: the response is only returned once the attempt is committed,
     # so a routed request can still fall back; a non-routed one keeps the
     # legacy behaviour of error frames inside the stream.
-    frames = _sse_stream(client, upstream, alias, attempts, surface_errors)
+    frames = _sse_stream(client, upstream, alias, attempts, surface_errors, failure_callback)
     if surface_errors:
         first, stream_failure = await _prime_stream(frames)
         if stream_failure is not None:
@@ -2778,12 +2830,17 @@ async def chat_completions(request: Request):
         return await _run_routed(
             route,
             lambda cand, headers: _dispatch_chat(
-                cand, route.body, headers, surface_errors=True
+                cand, route.body, headers, surface_errors=True,
+                failure_callback=lambda failure: _note_route_failure(route, cand, failure),
             ),
             stream=bool(route.body.get("stream", False)),
         )
     cand = route.candidates[0]
-    return await _dispatch_chat(cand, route.body, route_headers(route, cand))
+    response = await _dispatch_chat(
+        cand, route.body, route_headers(route, cand),
+        failure_callback=lambda failure: _note_route_failure(route, cand, failure),
+    )
+    return _observe_route_response(route, cand, response)
 
 
 # ------------------------------- usage report ------------------------------ #
@@ -2905,6 +2962,7 @@ def _sse_responses_stream(
     alias: str,
     kwargs: Dict[str, Any],
     surface_errors: bool = False,
+    failure_callback: Any = None,
 ) -> Generator[str, None, None]:
     """Run the SDK Responses stream and re-emit typed OpenAI SSE events.
 
@@ -2918,10 +2976,14 @@ def _sse_responses_stream(
     """
     recorded_usage = False
     yielded_any = False
+    stream = None
     try:
         stream = client.responses.create(model=upstream, stream=True, **kwargs)
         for event in stream:
             data = _rewrite_response_models(to_json_dict(event), alias)
+            failure = _payload_failure(data)
+            if failure:
+                raise failure
             if not recorded_usage:
                 usage: Any = data.get("usage")
                 if not isinstance(usage, dict) or not usage:
@@ -2933,10 +2995,14 @@ def _sse_responses_stream(
                     _track_usage(alias, usage, stream=True)
             yielded_any = True
             yield sse_event_frame(data)
+        if surface_errors and not yielded_any:
+            raise _AttemptFailure(502, "Upstream returned an empty stream.")
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
         status, message, err_type, code, param = _exception_details(exc)
         if surface_errors and not yielded_any:
             raise _AttemptFailure(status, message, err_type, code, param)
+        if failure_callback:
+            failure_callback(_AttemptFailure(status, message, err_type, code, param))
         if status >= 500:
             logging.exception("Upstream responses stream failed (status=%s)", status)
         else:
@@ -2951,6 +3017,8 @@ def _sse_responses_stream(
                 "param": param,
             }
         )
+    finally:
+        _close_stream(stream)
 
 
 def _sse_nrp_responses_stream(
@@ -2959,6 +3027,7 @@ def _sse_nrp_responses_stream(
     alias: str,
     kwargs: Dict[str, Any],
     surface_errors: bool = False,
+    failure_callback: Any = None,
 ) -> Generator[str, None, None]:
     """Stream NRP chat completions and re-emit them as Responses SSE events.
 
@@ -2974,6 +3043,7 @@ def _sse_nrp_responses_stream(
     translator = _ChatToResponsesSSE(alias, upstream)
     kwargs = _nrp_chat_kwargs(client, kwargs)
     emitted = False
+    stream = None
     if not surface_errors:
         for frame in translator.start_events():
             yield frame
@@ -2982,21 +3052,25 @@ def _sse_nrp_responses_stream(
         stream = client.chat.completions.create(
             model=upstream, stream=True, **kwargs
         )
-        if not emitted:
-            # Routed attempt: the upstream accepted the request, so the
-            # synthetic start events are safe to commit now.
-            for frame in translator.start_events():
-                emitted = True
-                yield frame
         for chunk in stream:
             data = to_json_dict(chunk)
-            for frame in translator.consume(data):
+            failure = _payload_failure(data)
+            if failure:
+                raise failure
+            if not emitted:
+                # Creating an iterator is not acceptance: wait for upstream data.
                 emitted = True
+                yield from translator.start_events()
+            for frame in translator.consume(data):
                 yield frame
+        if surface_errors and not emitted:
+            raise _AttemptFailure(502, "Upstream returned an empty stream.")
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
         status, message, err_type, code, param = _exception_details(exc)
         if surface_errors and not emitted:
             raise _AttemptFailure(status, message, err_type, code, param)
+        if failure_callback:
+            failure_callback(_AttemptFailure(status, message, err_type, code, param))
         if status >= 500:
             logging.exception("NRP bridge stream failed (status=%s)", status)
         else:
@@ -3005,6 +3079,8 @@ def _sse_nrp_responses_stream(
             {"type": "error", "message": message, "code": code, "param": param}
         )
         return
+    finally:
+        _close_stream(stream)
     for frame in translator.finish():
         yield frame
 
@@ -3035,14 +3111,17 @@ def _pin_response_stream(frames: Any, alias: str) -> Generator[str, None, None]:
     model, so the id is learned from the first frame that contains it.
     """
     pinned = False
-    for frame in frames:
-        if not pinned:
-            rid = _response_id_from_frame(frame)
-            if rid:
-                if ROUTER is not None:
-                    ROUTER.remember_response(rid, alias)
-                pinned = True
-        yield frame
+    try:
+        for frame in frames:
+            if not pinned:
+                rid = _response_id_from_frame(frame)
+                if rid:
+                    if ROUTER is not None:
+                        ROUTER.remember_response(rid, alias)
+                    pinned = True
+            yield frame
+    finally:
+        _close_stream(frames)
 
 
 async def _dispatch_responses(
@@ -3052,6 +3131,7 @@ async def _dispatch_responses(
     *,
     surface_errors: bool = False,
     pin: bool = False,
+    failure_callback: Any = None,
 ) -> Response:
     """Send one /v1/responses request to one concrete model.
 
@@ -3104,7 +3184,7 @@ async def _dispatch_responses(
             _remember(data.get("id"))
             return JSONResponse(data, headers=extra_headers)
         frames = _sse_nrp_responses_stream(
-            client, upstream, alias, kwargs, surface_errors
+            client, upstream, alias, kwargs, surface_errors, failure_callback
         )
         if surface_errors:
             first, failure = await _prime_stream(frames)
@@ -3159,7 +3239,7 @@ async def _dispatch_responses(
     # Streaming: headers are sent before the request is made, so upstream
     # errors are surfaced as a typed SSE error event. A routed attempt primes
     # the stream first so it can still fall back to another model.
-    frames = _sse_responses_stream(client, upstream, alias, kwargs, surface_errors)
+    frames = _sse_responses_stream(client, upstream, alias, kwargs, surface_errors, failure_callback)
     if surface_errors:
         first, failure = await _prime_stream(frames)
         if failure is not None:
@@ -3190,12 +3270,18 @@ async def responses_create(request: Request):
         return await _run_routed(
             route,
             lambda cand, headers: _dispatch_responses(
-                cand, route.body, headers, surface_errors=True, pin=True
+                cand, route.body, headers, surface_errors=True, pin=True,
+                failure_callback=lambda failure: _note_route_failure(route, cand, failure),
             ),
             stream=bool(route.body.get("stream", False)),
+            wire="responses",
         )
     cand = route.candidates[0]
-    return await _dispatch_responses(cand, route.body, route_headers(route, cand))
+    response = await _dispatch_responses(
+        cand, route.body, route_headers(route, cand),
+        failure_callback=lambda failure: _note_route_failure(route, cand, failure),
+    )
+    return _observe_route_response(route, cand, response)
 
 
 # ------------------------------ error handlers ----------------------------- #

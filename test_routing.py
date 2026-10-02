@@ -14,6 +14,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from unittest.mock import patch
 
 import routing
 
@@ -262,7 +263,7 @@ def main() -> int:
     p = plan(make_router(0.0), "auto-free")
     check(
         "max_attempts caps the candidate list",
-        len(p.candidates) == 3,
+        len(p.candidates) == 4 and p.candidates == FREE + PAID[:1],
         str(p.candidates),
     )
 
@@ -546,12 +547,137 @@ def main() -> int:
         p.reason()[:120],
     )
 
+    regression_checks()
+
     print(f"\n  {PASSED} passed, {len(FAILED)} failed")
     if FAILED:
         print("  FAILED: " + ", ".join(FAILED))
         return 1
     print("ROUTING TESTS PASSED")
     return 0
+
+
+def regression_checks() -> None:
+    for alias in routing.VIRTUAL_ALIASES:
+        for spend in (250.0, 260.0):
+            p = plan(make_router(spend), alias, hints={"paid_approved": True})
+            check(f"regression: approval never bypasses cap ({alias}, {spend})", p.candidates == FREE, str(p.candidates))
+    for body in (
+        {"input": [{"type": "item_reference", "id": "msg_1"}, {"role": "user", "content": "hi"}]},
+        {"input": [{"type": "reasoning", "summary": []}, {"role": "user", "content": "hi"}]},
+        {"input": [{"role": "user", "content": [{"type": "input_file", "file_id": "f_1"}]}]},
+        {"input": [{"role": "user", "content": [{"type": "input_image", "image_url": "url", "detail": "high"}]}]},
+        {"input": [{"type": "function_call_output", "call_id": "c", "output": [{"type": "input_text", "text": "result"}]}]},
+        {"input": [{"role": "assistant", "content": "hi", "phase": "commentary"}]},
+        {"truncation": "disabled"},
+        {"service_tier": "priority"},
+        {"prompt_cache_key": "key"},
+        {"safety_identifier": "user"},
+        {"max_tool_output_tokens": 123},
+        {"top_logprobs": 5},
+        {"reasoning": {"effort": "none"}},
+        {"reasoning": {"effort": "high", "summary": "auto"}},
+        {"text": {"verbosity": "low"}},
+        {"text": {"format": {"type": "json_schema", "name": "answer", "schema": {"type": "object"}}}},
+        {"tool_choice": {"type": "function", "name": "lookup", "future_option": True}},
+        {"metadata": {"not-a-string": 4}},
+        {"tools": [{"type": "future_native_tool"}]},
+    ):
+        p = plan(make_router(), "auto-free", wire="responses", body=body)
+        check(f"regression: lossy bridge excluded ({body})", not set(p.candidates) & set(FREE), str(p.candidates))
+        err = error_from(lambda: plan(make_router(), "auto-free", wire="responses", body=body, hints={"allow_paid": False}))
+        check(f"regression: lossy free-only bridge rejected ({body})", err is not None and err.code == "unsupported_native_feature", str(err))
+    p = plan(make_router(), "auto-free", wire="responses", body={
+        "input": [{"type": "function_call", "name": "lookup", "call_id": "c", "arguments": "{}"},
+                  {"type": "function_call_output", "call_id": "c", "output": "result"}],
+        "tools": [{"type": "function", "name": "lookup", "parameters": {}}],
+        "store": False, "background": False, "text": {"format": {"type": "text"}},
+    })
+    check("regression: faithful tools/history/no-op settings stay free", p.candidates[:3] == FREE, str(p.candidates))
+    r = make_router(config={"pools": {"paid": [], "hard": [], "review": []}})
+    check("regression: explicit empty paid pools stay empty", r.pools["paid"] == [] and r.pools["hard"] == [] and plan(r, "auto-free").candidates == FREE, str(r.pools))
+    r = routing.Router(REGISTRY, config={"paid_approval_threshold_usd": 0}, spend_func=lambda: 0)
+    check("regression: zero approval threshold is honoured", r.approval_threshold_usd == 0 and plan(r, "auto-hard").candidates == FREE)
+    r = routing.Router(REGISTRY, config={"monthly_budget_usd": 0}, spend_func=lambda: 300)
+    check("regression: zero budget disables advisory cap", r.monthly_budget_usd == 0 and plan(r, "auto-hard", hints={"paid_approved": True}).candidates)
+    for config in (
+        {"pools": []}, {"pools": {"paid": "gpt-6-luna"}}, {"pools": {"free": [None]}},
+        {"max_attempts": 2.5}, {"max_attempts": False}, {"deadline_seconds": 0},
+        {"deadline_seconds": float("nan")}, {"monthly_budget_usd": -1},
+        {"paid_approval_threshold_usd": float("inf")}, {"monthly_budget_usd": None},
+        {"capabilities": []}, {"capabilities": {"qwen3": {"tools": "false"}}},
+        {"native_only_params": "store"},
+    ):
+        try:
+            routing.Router(REGISTRY, config=config)
+        except ValueError:
+            check(f"regression: invalid policy rejected ({config})", True)
+        else:
+            check(f"regression: invalid policy rejected ({config})", False)
+    for message in (
+        "Quota exceeded for requests per minute; retry after 60 seconds",
+        "Monthly token rate limit exceeded; retry-after: 3600",
+        "Quota exceeded for tokens per hour",
+    ):
+        check(f"regression: temporary quota not wallet exhaustion ({message})", not routing.is_quota_exhaustion(429, message, "quota_exceeded"))
+    check("regression: ambiguous quota code is not proof of spent funds", not routing.is_quota_exhaustion(429, "Quota exceeded", "quota_exceeded"))
+    check("regression: monetary quota phrasing remains exhaustion", routing.is_quota_exhaustion(429, "Monthly spending limit exceeded", "quota_exceeded"))
+    check("regression: 403 quota wording is still an auth failure", not routing.is_quota_exhaustion(403, "insufficient quota", "insufficient_quota"))
+
+    usage = routing.usage_mod
+    with tempfile.TemporaryDirectory() as tmp, patch.object(usage, "USAGE_TRACKING", True), patch.object(usage, "current_month", return_value="2026-09"):
+        path = Path(tmp) / "usage.jsonl"
+        with patch.object(usage, "USAGE_LOG_PATH", path), patch.object(usage, "_MONTH_STATE", {"month": None, "total": 0.0}):
+            check("regression: new missing log is known zero", usage.spent_this_month() == 0.0)
+        path.mkdir()
+        with patch.object(usage, "USAGE_LOG_PATH", path), patch.object(usage, "_MONTH_STATE", {"month": None, "total": 0.0}):
+            r = routing.Router(REGISTRY)
+            check("regression: unreadable log means unknown spend", usage.spent_this_month() is None and r.spend_state()["approval_required"])
+            path.rmdir()
+            path.write_text(json.dumps({"month": "2026-09", "cost_usd": 231}) + "\n")
+            check("regression: failed read is retried, not cached as zero", usage.spent_this_month() == 231)
+        path.write_text("{broken json\n")
+        with patch.object(usage, "USAGE_LOG_PATH", path), patch.object(usage, "_MONTH_STATE", {"month": None, "total": 0.0}):
+            check("regression: corrupt log means unknown spend", usage.spent_this_month() is None)
+        path.write_text(json.dumps({"month": "2026-09", "cost_usd": 0.01}) + "\n")
+        with patch.object(usage, "USAGE_LOG_PATH", path), patch.object(usage, "_MONTH_STATE", {"month": None, "total": 0.0}), patch.object(usage._PRICING, "rates", return_value=None):
+            r = routing.Router(REGISTRY)
+            usage.record("paid-unpriced", "deployment", "provider", {"prompt_tokens": 10, "completion_tokens": 1})
+            st = r.spend_state()
+            check("regression: new unpriced call requires paid approval", st["spend_usd"] is None and st["known_spend_usd"] == 0.01 and st["approval_required"])
+            check("regression: unknown price still permits free routing", plan(r, "auto-hard").candidates == FREE)
+            check("regression: reports preserve known subtotal/unpriced count", usage.monthly_report("2026-09")["requests_without_pricing"] == 1 and usage.monthly_report("2026-09")["spent_usd"] == 0.01)
+            with patch.object(usage, "_MONTH_STATE", {"month": None, "total": 0.0}):
+                check("regression: restart preserves unknown-cost gate", usage.spent_this_month() is None)
+            with patch.object(usage, "current_month", return_value="2026-10"):
+                check("regression: month rollover clears unpriced uncertainty", usage.spent_this_month() == 0)
+        path.write_text("\n".join(json.dumps({"month": "2026-09", "cost_usd": cost}) for cost in (260, None)) + "\n")
+        with patch.object(usage, "USAGE_LOG_PATH", path), patch.object(usage, "_MONTH_STATE", {"month": None, "total": 0.0}):
+            r = routing.Router(REGISTRY)
+            st = r.spend_state()
+            err = error_from(lambda: plan(r, "gpt-6.1-sol", hints={"paid_approved": True}))
+            check("regression: unpriced usage cannot erase known cap exhaustion", st["spend_usd"] is None and st["budget_exhausted"] and err is not None and err.code == "budget_exhausted")
+            check("regression: approved virtual route respects known subtotal cap", plan(r, "auto-hard", hints={"paid_approved": True}).candidates == FREE)
+        path.unlink()
+        path.mkdir()
+        with patch.object(usage, "USAGE_LOG_PATH", path), patch.object(usage, "_MONTH_STATE", {"month": None, "total": 0.0}), patch.object(usage._PRICING, "rates", return_value={"input": 100.0, "output": 100.0}):
+            usage.record("paid", "deployment", "provider", {"prompt_tokens": 10})
+            check("regression: failed append makes spend unknown but retains charges", usage.spent_this_month() is None and usage.spend_snapshot()["known_spend_usd"] == 10)
+            path.rmdir()
+            path.write_text(json.dumps({"month": "2026-09", "cost_usd": 240}) + "\n")
+            st = routing.Router(REGISTRY).spend_state()
+            check("regression: recovered reads add unlogged charges to subtotal", st["spend_usd"] is None and st["known_spend_usd"] == 250 and st["budget_exhausted"])
+        for value in ("bad", "nan", "-1"):
+            with patch.dict(routing.os.environ, {"ROUTER_DEADLINE_SECONDS": value}):
+                try:
+                    routing.Router(REGISTRY)
+                except ValueError:
+                    check(f"regression: malformed environment limit rejected ({value})", True)
+                else:
+                    check(f"regression: malformed environment limit rejected ({value})", False)
+        with patch.dict(routing.os.environ, {"PAID_APPROVAL_THRESHOLD_USD": "bad"}):
+            r = routing.Router(REGISTRY, config={"paid_approval_threshold_usd": 0}, spend_func=lambda: 0)
+            check("regression: explicit config overrides unused malformed environment", r.approval_threshold_usd == 0)
 
 
 if __name__ == "__main__":

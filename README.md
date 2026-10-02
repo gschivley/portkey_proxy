@@ -238,6 +238,11 @@ and with the router off (the default) nothing changes at all.
 Pools are reconfigured with `ROUTER_FREE_POOL` / `ROUTER_PAID_POOL` /
 `ROUTER_HARD_POOL` / `ROUTER_REVIEW_POOL` (comma-separated aliases) or a
 `ROUTER_CONFIG_PATH` JSON file. `GET /v1/router` shows the live configuration.
+An explicit empty JSON pool (`"paid": []`, for example) stays empty; omitted
+pools use defaults. A zero approval threshold requires approval from the first
+paid request; a zero monthly budget disables the advisory dollar cap (not
+verified upstream exhaustion). Invalid pool types, numeric limits, and
+capability values fail startup instead of silently restoring defaults.
 
 ### Per-request hints
 
@@ -270,42 +275,57 @@ never silently drops content or parameters to make a model fit:
 - image/audio input on a model declared without it (declare extras in the
   config file's `capabilities`)
 - Responses-only parameters (`previous_response_id`, `store`, `background`,
-  `include`, `prompt`) and native tool types (`web_search`, `mcp`, `shell`, …)
-  on an NRP model, which is served through the chat bridge
+  `include`, `prompt`, `truncation`, `service_tier`, …), native tool types
+  (`web_search`, `mcp`, `shell`, …), item references, files, unknown input/content
+  types, JSON-schema formatting, and nested reasoning/text or tool-choice
+  options the NRP chat bridge cannot preserve
+- `store: false` / `background: false`, ordinary text, and supported function
+  call/result history remain bridgeable; intrinsic fidelity exclusions cannot
+  be disabled by `native_only_params` or capability overrides
 - `RESPONSES_ENABLED=0` excludes every model from a Responses route
 
 ### Bounded fallback
 
-Candidates are tried in order, at most `ROUTER_MAX_ATTEMPTS` (default 3)
+Candidates are tried in order, at most `ROUTER_MAX_ATTEMPTS` (default 4)
 dispatches per request and no new attempt after `ROUTER_DEADLINE_SECONDS`
-(default 120). A 404/408/425/429/5xx, an empty stream, or an upstream
+(default 120). The default leaves a paid attempt after three free failures;
+paid-to-free reverts share the same attempt count and deadline. A
+404/408/425/429/5xx, an empty stream, or an upstream
 "unsupported parameter" 400 moves to the next model; an authentication failure
 does not. **Nothing is replayed once bytes have reached the client**: the first
-stream chunk is pulled before the response is committed, and a stream that dies
-mid-body is surfaced as an SSE error frame on the same response.
+upstream chunk is pulled before the response is committed (synthetic bridge
+startup/completion frames do not count), and a stream that dies mid-body is
+surfaced as an SSE error frame on the same response. Responses errors are typed
+`error` events without a chat wrapper or `[DONE]` sentinel.
 
 ### Budget gates (advisory)
 
 Spend comes from the same `usage.jsonl` the `/v1/usage` report uses, so no
-second ledger exists. The gates are advisory, and the hard rule is: **money
-never breaks a routed request** — only an explicitly named paid model can be
-refused.
+second ledger exists. Budget gates degrade virtual routes to eligible free
+models rather than refuse them; if no free model can honour the request, the
+normal capability/policy error is returned. `paid_approved: true` bypasses the
+approval threshold only, **never the monthly cap or verified exhaustion**.
+Unreadable/corrupt logs, unpriced paid calls, and failed appends make total
+spend unknown and require approval. The known subtotal is still exposed as
+`known_spend_usd` and enforces the cap even when other costs are unknown.
 
 | Recorded monthly spend | `auto-*` route | Explicit paid model |
 | -------------------------- | ---------------- | --------------------- |
 | below `PAID_APPROVAL_THRESHOLD_USD` (230) | paid models allowed | allowed |
-| unknown (usage tracking off / unreadable log) | free models only | 402 `paid_approval_required` unless `paid_approved: true` |
-| at or above 230 | free models only | 402 `paid_approval_required` unless `paid_approved: true` |
+| unknown (tracking off / unreadable log / missing prices / failed append) | free models unless `paid_approved: true` | 402 `paid_approval_required` unless `paid_approved: true` |
+| at or above 230, below cap | free models unless `paid_approved: true` | 402 `paid_approval_required` unless `paid_approved: true` |
 | at or above `MONTHLY_BUDGET_USD` (250) | free models only | 402 `budget_exhausted` |
 | upstream proved the key's quota is spent (402 / `insufficient_quota`) | free models only | 402 `budget_exhausted` |
 
 Verified quota exhaustion is remembered per Portkey key (reported as a hashed
 `exhausted_scopes` entry, never the key itself) for the rest of the calendar
-month, so a dead wallet stops costing round trips; a plain 429 rate limit is
-*not* treated as exhaustion. Clear it with `POST /v1/router/reset`. A request
-already in flight switches to a free model without failing: `auto-hard` whose
-paid model answers 402 is served by the free pool in the same request, and the
-log line reads `router: paid tier unavailable (...); reverting to free models`.
+month, so a dead wallet stops costing round trips; a plain 429 or temporary
+request/token `quota_exceeded` rate limit is *not* treated as exhaustion.
+Explicit paid failures also update this state, without substituting another
+model on that explicit request. Clear it with `POST /v1/router/reset`.
+An in-flight virtual paid request can revert to the free pool in the same
+request after a 402, subject to the remaining attempt/deadline limits and the
+normal authentication/capability rules.
 
 Because spend is read when a request is planned, several concurrent requests
 can each be admitted before any of them is recorded: the caps are advisory, and
@@ -428,8 +448,8 @@ freely (a month's totals are always recomputed from the records present).
 Two suites, both against a mock upstream (no real key needed):
 
 ```bash
-./.venv/bin/python test_routing.py   # 86 checks: router policy in isolation
-./.venv/bin/python test_proxy.py     # 250 checks: end-to-end, incl. the router
+./.venv/bin/python test_routing.py   # 170 checks: router policy and spend reader
+./.venv/bin/python test_proxy.py     # 342 checks: end-to-end + controlled stream regressions
 ```
 
 `test_routing.py` exercises `routing.py` directly (pools, hints, capability
