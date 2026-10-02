@@ -107,6 +107,8 @@ def main() -> int:
     proxy2_log = None
     proxy3: subprocess.Popen | None = None
     proxy3_log = None
+    proxy4: subprocess.Popen | None = None
+    proxy4_log = None
 
     mock = subprocess.Popen(
         [PY, str(ROOT / "mock_upstream.py"), "--port", str(mock_port)],
@@ -129,6 +131,9 @@ def main() -> int:
             "CLAUDE_SONNET_55_UPSTREAM_MODEL": "upstream-sonnet",
             "CLAUDE_FABLE_51_UPSTREAM_MODEL": "upstream-fable",
             "INCLUDE_STREAM_USAGE": "1",
+            # Blank the NRP key so a developer's real .env / shell export can
+            # never leak into the default proxies (section 10 sets its own).
+            "NRP_API_KEY": "",
             # Usage tracking gets its own proxy instance (section 9); keep the
             # default proxies from writing the repo's usage.jsonl or hitting
             # the real pricing API.
@@ -1631,12 +1636,401 @@ def main() -> int:
             str(sorted(cache)),
         )
 
+        # ------------------------------------------------------------ #
+        # 10. NRP api_source: Bearer auth + Responses-via-chat bridge ---
+        # ------------------------------------------------------------ #
+        # The default proxy has no NRP key; a dedicated proxy points
+        # NRP_BASE_URL at the mock (the mock ignores auth but records the
+        # headers, which is exactly what the 403 regression needs).
+        # The registry always lists the aliases; without a key, requests to
+        # them are rejected with 401 (the client is never built).
+        r = client.get("/v1/models")
+        check(
+            "nrp: aliases listed even without a key",
+            r.status_code == 200
+            and {"qwen3", "deepseek-v4-flash", "glm-5"}
+            <= {m["id"] for m in r.json()["data"]},
+            str(sorted(m["id"] for m in r.json()["data"]))[:200],
+        )
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "x"}]},
+        )
+        check(
+            "nrp: chat without NRP_API_KEY -> 401",
+            r.status_code == 401 and "NRP_API_KEY" in r.text,
+            r.text,
+        )
+        r = client.post("/v1/responses", json={"model": "glm-5", "input": "x"})
+        check(
+            "nrp: responses without NRP_API_KEY -> 401",
+            r.status_code == 401,
+            r.text,
+        )
+
+        env4 = dict(env)
+        env4.update(
+            {
+                "NRP_API_KEY": "nrp-test-key",
+                "NRP_BASE_URL": f"http://127.0.0.1:{mock_port}/v1",
+            }
+        )
+        proxy4_port = free_port()
+        stale4 = ROOT / "_proxy4.log"
+        if stale4.exists():
+            stale4.unlink()
+        proxy4_log = open(stale4, "w")
+        proxy4 = subprocess.Popen(
+            [PY, str(ROOT / "proxy.py"), "--port", str(proxy4_port)],
+            stdout=proxy4_log,
+            stderr=subprocess.STDOUT,
+            cwd=ROOT,
+            env=env4,
+        )
+        base4 = f"http://127.0.0.1:{proxy4_port}"
+        wait_ready(base4)
+        client4 = httpx.Client(base_url=base4, timeout=30.0)
+
+        r = client4.get("/v1/models")
+        check(
+            "nrp: models listed with NRP_API_KEY",
+            r.status_code == 200
+            and {"qwen3", "deepseek-v4-flash", "glm-5"}
+            <= {m["id"] for m in r.json()["data"]},
+            str(sorted(m["id"] for m in r.json()["data"]))[:200],
+        )
+
+        # --- plain chat: Bearer auth, no portkey headers, alias rewrite ---
+        r = client4.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "nrp: chat returns 200",
+            r.status_code == 200
+            and r.json()["choices"][0]["message"]["content"]
+            == "Hello from mock upstream!",
+            r.text,
+        )
+        check(
+            "nrp: chat rewrites model to alias",
+            r.json().get("model") == "deepseek-v4-flash",
+            str(r.json().get("model")),
+        )
+        check(
+            "nrp: chat uses Bearer auth with NRP key",
+            cap["headers"].get("authorization") == "Bearer nrp-test-key",
+            str(cap["headers"].get("authorization"))[:20],
+        )
+        check(
+            "nrp: no x-portkey-* headers leak to NRP",
+            not any(k.startswith("x-portkey") for k in cap["headers"]),
+            str([k for k in cap["headers"] if k.startswith("x-portkey")]),
+        )
+        check(
+            "nrp: chat rewrites alias to upstream model",
+            cap["body"].get("model") == "deepseek-v4-flash",
+            str(cap["body"].get("model")),
+        )
+
+        # --- responses -> chat bridge: non-streaming, text ---------------
+        r = client4.post(
+            "/v1/responses",
+            json={"model": "deepseek-v4-flash", "input": "Hi"},
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "nrp: responses bridged to chat endpoint",
+            r.status_code == 200 and cap["path"] == "/v1/chat/completions",
+            str(cap.get("path")),
+        )
+        check(
+            "nrp: bridged input becomes chat messages",
+            cap["body"].get("messages") == [{"role": "user", "content": "Hi"}],
+            str(cap["body"].get("messages")),
+        )
+        check(
+            "nrp: bridged response is a Responses envelope",
+            r.json().get("object") == "response"
+            and r.json().get("status") == "completed"
+            and r.json().get("model") == "deepseek-v4-flash"
+            and r.json()["output"][0]["content"][0]["text"]
+            == "Hello from mock upstream!",
+            json.dumps(r.json())[:300],
+        )
+        check(
+            "nrp: bridged envelope keeps upstream id and resp_ fallback works",
+            r.json().get("id") == "cmpl-mock-0001",
+            str(r.json().get("id")),
+        )
+
+        # --- responses bridge: tools + tool results ----------------------
+        r = client4.post(
+            "/v1/responses",
+            json={
+                "model": "deepseek-v4-flash",
+                "instructions": "Be brief.",
+                "input": [
+                    {"role": "user", "content": "Weather?"},
+                    {
+                        "type": "function_call",
+                        "name": "get_weather",
+                        "call_id": "call_1",
+                        "arguments": '{"city":"Princeton"}',
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "21C and sunny",
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    }
+                ],
+                "tool_choice": "auto",
+                "max_output_tokens": 512,
+                "reasoning": {"effort": "high"},
+                "mock_chat_tool_call": True,
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "nrp: bridged tools re-nested under function",
+            cap["body"]["tools"]
+            == [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            str(cap["body"].get("tools")),
+        )
+        check(
+            "nrp: bridged instructions becomes system message",
+            cap["body"]["messages"][0]
+            == {"role": "system", "content": "Be brief."},
+            str(cap["body"]["messages"][:1]),
+        )
+        check(
+            "nrp: bridged function_call becomes assistant tool_calls",
+            cap["body"]["messages"][2]
+            == {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city":"Princeton"}',
+                        },
+                    }
+                ],
+            },
+            str(cap["body"]["messages"][2:3]),
+        )
+        check(
+            "nrp: bridged function_call_output becomes tool message",
+            cap["body"]["messages"][3]
+            == {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "21C and sunny",
+                "name": "get_weather",
+            },
+            str(cap["body"]["messages"][3:4]),
+        )
+        check(
+            "nrp: bridged param renames (max_output_tokens, reasoning_effort)",
+            cap["body"].get("max_completion_tokens") == 512
+            and cap["body"].get("reasoning_effort") == "high"
+            and "max_output_tokens" not in cap["body"]
+            and "reasoning" not in cap["body"],
+            str(cap["body"]),
+        )
+        out = r.json()["output"]
+        check(
+            "nrp: bridged tool call converted back to function_call item",
+            out[0] == {
+                "id": "fc_call_mock_1",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": "call_mock_1",
+                "name": "get_weather",
+                "arguments": '{"city": "Princeton"}',
+            },
+            json.dumps(out)[:300],
+        )
+
+        # --- responses bridge: streaming text -----------------------------
+        r = client4.post(
+            "/v1/responses",
+            json={"model": "glm-5", "input": "Hi", "stream": True},
+        )
+        frames = parse_sse(r.text)
+        types = [f.get("type") for f in frames]
+        check(
+            "nrp: stream is typed Responses events",
+            r.status_code == 200 and types[0] == "response.created",
+            str(types[:4]),
+        )
+        text = "".join(
+            f.get("delta", "") for f in frames if f.get("type") == "response.output_text.delta"
+        )
+        check(
+            "nrp: stream reassembles bridged text",
+            text == "Hello from mock upstream!",
+            repr(text),
+        )
+        check(
+            "nrp: stream ends with response.completed",
+            types[-1] == "response.completed"
+            and frames[-1]["response"]["model"] == "glm-5",
+            str(types[-2:]),
+        )
+        check(
+            "nrp: stream has no [DONE] frame",
+            not any(f.get("done") for f in frames),
+            str(types[-1]),
+        )
+        check(
+            "nrp: stream model rewritten to alias",
+            frames[0]["response"]["model"] == "glm-5",
+            json.dumps(frames[0])[:150],
+        )
+
+        # --- responses bridge: streaming tool call ------------------------
+        r = client4.post(
+            "/v1/responses",
+            json={
+                "model": "qwen3",
+                "input": "Weather?",
+                "stream": True,
+                "mock_chat_tool_call": True,
+            },
+        )
+        frames = parse_sse(r.text)
+        types = [f.get("type") for f in frames]
+        args = "".join(
+            f.get("delta", "")
+            for f in frames
+            if f.get("type") == "response.function_call_arguments.delta"
+        )
+        check(
+            "nrp: streamed tool call argument deltas reassemble",
+            args == '{"city": "Princeton"}',
+            repr(args),
+        )
+        check(
+            "nrp: streamed tool call emits output_item.added",
+            "response.output_item.added" in types,
+            str(types[:6]),
+        )
+        completed = [f for f in frames if f.get("type") == "response.completed"]
+        fc = [
+            item
+            for item in completed[0]["response"]["output"]
+            if item.get("type") == "function_call"
+        ]
+        check(
+            "nrp: completed response carries function_call item",
+            len(fc) == 1
+            and fc[0]["name"] == "get_weather"
+            and fc[0]["call_id"] == "call_mock_1",
+            json.dumps(completed[0]["response"]["output"])[:250],
+        )
+
+        # --- chat client with tool history still works via plain chat -----
+        r = client4.post(
+            "/v1/chat/completions",
+            json={
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role": "user", "content": "Weather?"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "get_weather", "parameters": {}},
+                    }
+                ],
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "nrp: chat tool round trip forwarded untouched",
+            r.status_code == 200 and len(cap["body"]["messages"]) == 3,
+            str(cap["body"].get("messages"))[:200],
+        )
+
+        # --- missing NRP key on the dedicated proxy: 401 path ------------
+        r = client4.post(
+            "/v1/responses",
+            json={"model": "gpt-5.6-sol", "input": "Hi"},
+        )
+        check(
+            "nrp proxy: portkey models still work",
+            r.status_code == 200 and r.json()["object"] == "response",
+            r.text[:150],
+        )
+
+        p4log = (ROOT / "_proxy4.log").read_text(encoding="utf-8", errors="replace")
+        check(
+            "nrp: bridge log line emitted",
+            "responses request bridged via chat" in p4log,
+            p4log[-300:],
+        )
+        check(
+            "nrp: no 403 in proxy log",
+            "403" not in p4log,
+            [ln for ln in p4log.splitlines() if "403" in ln][:3],
+        )
+
+        client4.close()
+
     finally:
         procs = [(proxy, proxy_log), (mock, mock_log)]
         if proxy2 is not None:
             procs.append((proxy2, proxy2_log))
         if proxy3 is not None:
             procs.append((proxy3, proxy3_log))
+        if proxy4 is not None:
+            procs.append((proxy4, proxy4_log))
         for proc, _ in procs:
             proc.terminate()
         for proc, log in procs:

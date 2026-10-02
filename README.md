@@ -19,14 +19,43 @@ Exposed models (by default):
 | `claude-opus-5-5`             | `claude-opus-5-5` |
 | `claude-sonnet-5-5`           | `claude-sonnet-5-5` |
 | `claude-fable-5-1`            | `claude-fable-5-1` |
+| `qwen3`                       | `qwen3` (NRP)  |
+| `deepseek-v4-flash`           | `deepseek-v4-flash` (NRP) |
+| `glm-5`                       | `glm-5` (NRP)  |
 
-The aliases are passed through to Portkey as-is. If an alias is not a real
-deployment name on the sandbox, map it to a real model by setting the matching
-`*_UPSTREAM_MODEL` variable (e.g. `GPT56_SOL_UPSTREAM_MODEL`,
+The Portkey aliases are passed through to Portkey as-is. If an alias is not a
+real deployment name on the sandbox, map it to a real model by setting the
+matching `*_UPSTREAM_MODEL` variable (e.g. `GPT56_SOL_UPSTREAM_MODEL`,
 `GPT6_ASTRA_UPSTREAM_MODEL`, `GPT6_SOL_UPSTREAM_MODEL`, `GEMINI38_FLASH_UPSTREAM_MODEL`,
 `CLAUDE_OPUS_55_UPSTREAM_MODEL`, `CLAUDE_SONNET_55_UPSTREAM_MODEL`,
 `CLAUDE_FABLE_51_UPSTREAM_MODEL`; or editing
 `MODEL_REGISTRY` in `proxy.py`) — e.g. `claude-sonnet-4-6`.
+
+The `qwen3`, `deepseek-v4-flash`, and `glm-5` aliases are routed to the NRP
+gateway (`https://ellm.nrp-nautilus.io/v1`) instead of Portkey. They use the
+`NRP_API_KEY` from the environment (never the per-request key), and because
+they are zero-cost they are excluded from the usage report (`track_usage=False`
+in `MODEL_REGISTRY`). Their upstream names can be overridden with
+`QWEN3_UPSTREAM_MODEL`, `DEEPSEEK_V4_FLASH_UPSTREAM_MODEL`, and
+`GLM5_UPSTREAM_MODEL`.
+
+Two NRP quirks are handled transparently:
+
+- **Auth.** NRP is a vanilla OpenAI-compatible gateway expecting
+  `Authorization: Bearer <key>`. The Portkey SDK instead masks that header and
+  sends the key as `x-portkey-api-key`, which NRP rejects with 403 — so NRP
+  requests go through a plain OpenAI client (`get_nrp_client`) instead of the
+  SDK.
+- **No working Responses API.** NRP exposes `/v1/responses` but does not
+  implement it (its gateway forwards Responses bodies to chat-completions
+  validation and 400s). For registry entries with `responses_via_chat: True`,
+  the proxy converts the Responses request into chat-completions parameters
+  (`input` items → `messages`, flat tools → nested, `function_call` /
+  `function_call_output` → `tool_calls` / tool messages,
+  `max_output_tokens` → `max_completion_tokens`, `reasoning.effort` →
+  `reasoning_effort`), calls `/v1/chat/completions`, and translates the reply —
+  JSON or SSE — back into Responses shapes. Copilot keeps talking Responses and
+  never learns the difference.
 
 ## Endpoints
 
@@ -133,6 +162,7 @@ form, so the client still sees an ordinary `chat.completion`. See
 | Reasoning | `reasoning_effort` (flat) | `reasoning: {"effort": ...}` (nested) |
 | Tools + reasoning on GPT-5.6 | **rejected upstream** — reasoning is stripped, with an auto-retry using `"none"` | **accepted**, reasoning forwarded untouched |
 | Tools on the gpt-6 family | **rejected in every shape** — auto-bridged via Responses | **accepted** natively |
+| NRP models (`qwen3`, `deepseek-v4-flash`, `glm-5`) | **accepted** natively | **broken upstream** — auto-bridged via chat completions (`responses_via_chat`) |
 | Stream terminator | `data: [DONE]` | `response.completed` event (no `[DONE]`) |
 | Usage fields | `prompt_tokens` / `completion_tokens` | `input_tokens` / `output_tokens` (normalised into the same `usage.jsonl` schema) |
 | Conversation state | client resends history | `previous_response_id` — **verified working** on the Sandbox |
@@ -388,6 +418,8 @@ the banner (`Gateway timeout: ...`) or the started log to confirm.
 | ---------- | --------- | --------- |
 | `PORTKEY_API_KEY` | – (unset) | Optional fallback key for requests that send no API key; `AI_SANDBOX_KEY` also accepted |
 | `PORTKEY_BASE_URL` | `https://api.portkey.ai/v1` | Upstream gateway base URL (`/v1` appended if missing) |
+| `NRP_API_KEY` | – (unset) | API key for the NRP gateway models (`qwen3`, `deepseek-v4-flash`, `glm-5`); required to use those models |
+| `NRP_BASE_URL` | `https://ellm.nrp-nautilus.io/v1` | NRP gateway base URL (`/v1` appended if missing) |
 | `PROXY_HOST` / `PROXY_PORT` | `127.0.0.1` / `8090` | Where the proxy listens |
 | `PORTKEY_TIMEOUT_MS` | – (unset) | Per-request upstream timeout sent to the Portkey gateway, in **milliseconds**. Leave unset so the gateway default applies. Do NOT use seconds (e.g. `600` = 600 ms) — that caused `408 Request exceeded the timeout` |
 | `INCLUDE_STREAM_USAGE` | `1` | Send `stream_options.include_usage` to get token usage in streaming |
@@ -395,6 +427,7 @@ the banner (`Gateway timeout: ...`) or the started log to confirm.
 | `TOOLS_VIA_RESPONSES` | `auto` | Serve chat requests with function tools through the Responses API and translate the reply back: `auto` (only models with no working chat shape for tools, i.e. the `gpt-6` family), `always` (also GPT-5.6, preserving its reasoning), `never` (forward the upstream 400) |
 | `TOOLS_REASONING_EFFORT` | `strip` | For models that reject tools + reasoning (GPT-5.6 only): `strip`, `none`, or `keep` (the alternative is auto-tried on the upstream's tools+reasoning 400) |
 | `GPT56_SOL_UPSTREAM_MODEL` / `GPT56_TERRA_UPSTREAM_MODEL` / `GPT56_LUNA_UPSTREAM_MODEL` / `GPT6_ASTRA_UPSTREAM_MODEL` / `GPT6_SOL_UPSTREAM_MODEL` / `GEMINI38_FLASH_UPSTREAM_MODEL` | alias name | Map an alias to a different upstream model |
+| `QWEN3_UPSTREAM_MODEL` / `DEEPSEEK_V4_FLASH_UPSTREAM_MODEL` / `GLM5_UPSTREAM_MODEL` | alias name | Map an NRP alias to a different upstream model |
 | `GPT6_ASTRA_REASONING_EFFORTS` | `low,medium,high,xhigh` | Comma-separated `reasoning_effort` values the upstream accepts for `gpt-6-astra`; unsupported client values are rewritten to the first non-`none` entry |
 | `GEMINI38_FLASH_REASONING_EFFORTS` / `CLAUDE_OPUS_55_REASONING_EFFORTS` / `CLAUDE_SONNET_55_REASONING_EFFORTS` / `CLAUDE_FABLE_51_REASONING_EFFORTS` | – (unset) | Optional comma-separated `reasoning_effort` list for `gemini-3.8-flash` or a Claude model; when unset, client values are forwarded untouched |
 | `USAGE_TRACKING` | `1` | Record token usage and dollar cost of every request to the JSONL usage log |

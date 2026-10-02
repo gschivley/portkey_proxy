@@ -27,7 +27,11 @@ app = FastAPI()
 def _record(request: Request, body: Dict[str, Any]) -> None:
     CAPTURE.write_text(
         json.dumps(
-            {"headers": {k: v for k, v in request.headers.items()}, "body": body},
+            {
+                "path": request.url.path,
+                "headers": {k: v for k, v in request.headers.items()},
+                "body": body,
+            },
             indent=2,
         ),
         encoding="utf-8",
@@ -121,6 +125,8 @@ async def chat_completions(request: Request):
     cached_tokens = body.pop("mock_cached_tokens", None)
     # Test-only directive: report this many cache-write input tokens in usage.
     cache_write_tokens = body.pop("mock_cache_write_tokens", None)
+    # Test-only directive: reply with a tool call instead of a text message.
+    chat_tool_call = body.pop("mock_chat_tool_call", None)
     _record(request, body)
     model = body.get("model", "unknown")
     now = int(time.time())
@@ -178,20 +184,32 @@ async def chat_completions(request: Request):
         usage["prompt_tokens_details"] = details
 
     if not body.get("stream"):
+        if chat_tool_call:
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_mock_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": json.dumps({"city": "Princeton"}),
+                        },
+                    }
+                ],
+            }
+            finish = "tool_calls"
+        else:
+            message = {"role": "assistant", "content": "Hello from mock upstream!"}
+            finish = "stop"
         return {
             "id": "cmpl-mock-0001",
             "object": "chat.completion",
             "created": now,
             "model": model,
             "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "Hello from mock upstream!",
-                    },
-                    "finish_reason": "stop",
-                }
+                {"index": 0, "message": message, "finish_reason": finish},
             ],
             "usage": usage,
         }
@@ -211,30 +229,105 @@ async def chat_completions(request: Request):
                 ],
             }
         )
-        yield _sse(
-            {
-                **base,
-                "choices": [
-                    {"index": 0, "delta": {"content": "Hello "}, "finish_reason": None}
-                ],
-            }
-        )
+        if chat_tool_call:
+            yield _sse(
+                {
+                    **base,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_mock_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "get_weather",
+                                            "arguments": "",
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+            yield _sse(
+                {
+                    **base,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "function": {
+                                            "arguments": '{"city":'
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+            yield _sse(
+                {
+                    **base,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "function": {"arguments": ' "Princeton"}'},
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+        else:
+            yield _sse(
+                {
+                    **base,
+                    "choices": [
+                        {"index": 0, "delta": {"content": "Hello "}, "finish_reason": None}
+                    ],
+                }
+            )
+            yield _sse(
+                {
+                    **base,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "from mock upstream!"},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+        if (body.get("stream_options") or {}).get("include_usage"):
+            yield _sse({**base, "choices": [], "usage": usage})
         yield _sse(
             {
                 **base,
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"content": "from mock upstream!"},
-                        "finish_reason": None,
+                        "delta": {},
+                        "finish_reason": "tool_calls" if chat_tool_call else "stop",
                     }
                 ],
             }
-        )
-        if (body.get("stream_options") or {}).get("include_usage"):
-            yield _sse({**base, "choices": [], "usage": usage})
-        yield _sse(
-            {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
         )
         yield "data: [DONE]\n\n"
 
