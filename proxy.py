@@ -70,19 +70,24 @@ Configuration (local .env file next to this script, or environment):
     GPT6_ASTRA_UPSTREAM_MODEL    optional upstream model for gpt-6-astra
     GPT6_SOL_UPSTREAM_MODEL      optional upstream model for gpt-6.1-sol
     GEMINI38_FLASH_UPSTREAM_MODEL  optional upstream model for gemini-3.8-flash
-    CLAUDE_OPUS_48_UPSTREAM_MODEL  optional upstream model for claude-opus-4-8
-    CLAUDE_FABLE_5_UPSTREAM_MODEL  optional upstream model for claude-fable-5
+    CLAUDE_OPUS_55_UPSTREAM_MODEL     optional upstream model for claude-opus-5-5
+    CLAUDE_SONNET_55_UPSTREAM_MODEL   optional upstream model for claude-sonnet-5-5
+    CLAUDE_FABLE_51_UPSTREAM_MODEL    optional upstream model for claude-fable-5-1
     GPT6_ASTRA_REASONING_EFFORTS   comma-separated reasoning_effort values the
                            upstream accepts for gpt-6-astra (default
                            low,medium,high,xhigh — 'none' is rejected there)
     GEMINI38_FLASH_REASONING_EFFORTS
-    CLAUDE_OPUS_48_REASONING_EFFORTS
-    CLAUDE_FABLE_5_REASONING_EFFORTS
+    CLAUDE_OPUS_55_REASONING_EFFORTS
+    CLAUDE_SONNET_55_REASONING_EFFORTS
+    CLAUDE_FABLE_51_REASONING_EFFORTS
                            comma-separated accepted reasoning_effort values
                            for those models (default: unset, so whatever
                            the client sends is forwarded untouched)
     GEMINI38_FLASH_PRICING_MODEL   pricing-catalog model name for
                            gemini-3.8-flash (default gemini-3.8-flash-gt-128k)
+    GPT6_SOL_PRICING_MODEL pricing-catalog model name for gpt-6.1-sol
+                           (default gpt-6-sol — the catalog has no entry under
+                           the deployment name)
 
 Usage & cost tracking (see usage.py; GET /v1/usage, or run usage_report.py):
     USAGE_TRACKING       "0" to disable recording usage/cost (default on)
@@ -213,7 +218,7 @@ if TOOLS_VIA_RESPONSES not in ("auto", "always", "never"):
 # "gpt-5.6-sol" / "gpt-5.6-terra" are the names the Copilot app will use.
 # They are passed to Portkey as-is (they may be Portkey deployment aliases).
 # To route them to a different upstream model, set e.g.
-#   GPT56_SOL_UPSTREAM_MODEL=claude-sonnet-4-6
+#   GPT56_SOL_UPSTREAM_MODEL=claude-sonnet-5-5
 # or edit "upstream" below.
 #
 # Each model also declares a reasoning profile: upstreams disagree about
@@ -289,6 +294,9 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "reasoning": "gpt-6",
         "efforts_env": "GPT6_ASTRA_REASONING_EFFORTS",
         "provider": "openai",
+        # The pricing catalog lists this deployment as "gpt-6-sol"; looking it
+        # up under the request name 404s and the call is logged without a cost.
+        "pricing_model": os.environ.get("GPT6_SOL_PRICING_MODEL", "gpt-6-sol"),
     },
     "gemini-3.8-flash": {
         "upstream": os.environ.get("GEMINI38_FLASH_UPSTREAM_MODEL", "gemini-3.8-flash"),
@@ -301,18 +309,29 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
             "GEMINI38_FLASH_PRICING_MODEL", "gemini-3.8-flash-gt-128k"
         ),
     },
-    "claude-opus-4-8": {
-        "upstream": os.environ.get("CLAUDE_OPUS_48_UPSTREAM_MODEL", "claude-opus-4-8"),
-        "description": "Anthropic Claude Opus 4.8 via the AI Sandbox",
+    "claude-opus-5-5": {
+        "upstream": os.environ.get("CLAUDE_OPUS_55_UPSTREAM_MODEL", "claude-opus-5-5"),
+        "description": "Anthropic Claude Opus 5.5 via the AI Sandbox",
         "reasoning": "flexible",
-        "efforts_env": "CLAUDE_OPUS_48_REASONING_EFFORTS",
+        "efforts_env": "CLAUDE_OPUS_55_REASONING_EFFORTS",
         "provider": "anthropic",
     },
-    "claude-fable-5": {
-        "upstream": os.environ.get("CLAUDE_FABLE_5_UPSTREAM_MODEL", "claude-fable-5"),
-        "description": "Anthropic Claude Fable 5 via the AI Sandbox",
+    "claude-sonnet-5-5": {
+        "upstream": os.environ.get(
+            "CLAUDE_SONNET_55_UPSTREAM_MODEL", "claude-sonnet-5-5"
+        ),
+        "description": "Anthropic Claude Sonnet 5.5 via the AI Sandbox",
         "reasoning": "flexible",
-        "efforts_env": "CLAUDE_FABLE_5_REASONING_EFFORTS",
+        "efforts_env": "CLAUDE_SONNET_55_REASONING_EFFORTS",
+        "provider": "anthropic",
+    },
+    "claude-fable-5-1": {
+        "upstream": os.environ.get(
+            "CLAUDE_FABLE_51_UPSTREAM_MODEL", "claude-fable-5-1"
+        ),
+        "description": "Anthropic Claude Fable 5.1 via the AI Sandbox",
+        "reasoning": "flexible",
+        "efforts_env": "CLAUDE_FABLE_51_REASONING_EFFORTS",
         "provider": "anthropic",
     },
 }

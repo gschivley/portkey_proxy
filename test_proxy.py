@@ -16,7 +16,8 @@ proxy (proxy.py) as subprocesses, then verifies:
     auto-retries with reasoning_effort="none"; gpt-6-astra keeps tools+reasoning
     but rewrites unsupported values (e.g. "none" -> "low", or via a configured
     vocabulary); gemini-3.8-flash forwards effort values untouched; the
-    claude-opus-4-8 / claude-fable-5 aliases use the same flexible profile
+    claude-opus-5-5 / claude-sonnet-5-5 / claude-fable-5-1 aliases use the same
+    flexible profile
   - usage & cost tracking (usage.py): JSONL records for stream + non-stream
     calls with costs from the (mocked) pricing API, cached-token split,
     pricing_model overrides, unknown-price fallback, GET /usage aggregation,
@@ -124,8 +125,9 @@ def main() -> int:
             "GPT56_LUNA_UPSTREAM_MODEL": "upstream-luna",
             "GPT6_ASTRA_UPSTREAM_MODEL": "upstream-astra",
             "GEMINI38_FLASH_UPSTREAM_MODEL": "upstream-gemini",
-            "CLAUDE_OPUS_48_UPSTREAM_MODEL": "upstream-opus",
-            "CLAUDE_FABLE_5_UPSTREAM_MODEL": "upstream-fable",
+            "CLAUDE_OPUS_55_UPSTREAM_MODEL": "upstream-opus",
+            "CLAUDE_SONNET_55_UPSTREAM_MODEL": "upstream-sonnet",
+            "CLAUDE_FABLE_51_UPSTREAM_MODEL": "upstream-fable",
             "INCLUDE_STREAM_USAGE": "1",
             # Usage tracking gets its own proxy instance (section 9); keep the
             # default proxies from writing the repo's usage.jsonl or hitting
@@ -162,8 +164,9 @@ def main() -> int:
             and "gpt-6-astra" in ids
             and "gpt-6.1-sol" in ids
             and "gemini-3.8-flash" in ids
-            and "claude-opus-4-8" in ids
-            and "claude-fable-5" in ids,
+            and "claude-opus-5-5" in ids
+            and "claude-sonnet-5-5" in ids
+            and "claude-fable-5-1" in ids,
             str(r.json()),
         )
         r = client.get("/models")
@@ -533,8 +536,9 @@ def main() -> int:
         # Claude models: flexible profile, like gemini. Tools + reasoning are
         # forwarded as written (no strip), and effort values pass through.
         for alias, upstream_name in (
-            ("claude-opus-4-8", "upstream-opus"),
-            ("claude-fable-5", "upstream-fable"),
+            ("claude-opus-5-5", "upstream-opus"),
+            ("claude-sonnet-5-5", "upstream-sonnet"),
+            ("claude-fable-5-1", "upstream-fable"),
         ):
             claude_body = {
                 "model": alias,
@@ -1431,12 +1435,12 @@ def main() -> int:
         r = client3.post(
             "/v1/chat/completions",
             json={
-                "model": "claude-fable-5",
+                "model": "claude-fable-5-1",
                 "messages": [{"role": "user", "content": "Hi"}],
             },
         )
         check("usage: unpriced model request ok", r.status_code == 200, r.text)
-        fab = [x for x in usage_records() if x["model"] == "claude-fable-5"]
+        fab = [x for x in usage_records() if x["model"] == "claude-fable-5-1"]
         check(
             "usage: unpriced model recorded with cost null",
             len(fab) == 1 and fab[0]["cost_usd"] is None,
@@ -1492,15 +1496,67 @@ def main() -> int:
                 str(ln.get("cost_usd")),
             )
 
-        # GET /v1/usage and /usage aggregation (seed + 5 tracked requests).
-        spent = 49.9999 + mock_in + mock_nosplit + mock_gem + mock_in
+        # gpt-6.1-sol is priced under its catalog name (the deployment name
+        # 404s upstream, which previously left cost_usd null).
+        r = client3.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-6.1-sol",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        check("usage: gpt-6.1-sol request ok", r.status_code == 200, r.text)
+        s61 = [x for x in usage_records() if x["model"] == "gpt-6.1-sol"]
+        mock_61 = (12 * 0.0004 + 8 * 0.002) / 100
+        check(
+            "usage: gpt-6.1-sol priced under gpt-6-sol catalog name",
+            len(s61) == 1
+            and s61[0]["pricing_model"] == "gpt-6-sol"
+            and s61[0]["cost_usd"] is not None
+            and abs(s61[0]["cost_usd"] - mock_61) < 1e-9,
+            str(s61),
+        )
+
+        # Cache-write tokens are a priced subset of the input: plain input,
+        # cache-write and cache-read are each billed at their own rate.
+        r = client3.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-6-astra",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "mock_cached_tokens": 4,
+                "mock_cache_write_tokens": 3,
+            },
+        )
+        check("usage: cache-write request ok", r.status_code == 200, r.text)
+        cw = [x for x in usage_records() if x["model"] == "gpt-6-astra"]
+        mock_cw = (5 * 0.0004 + 3 * 0.0005 + 4 * 0.00004 + 8 * 0.002) / 100
+        check(
+            "usage: cache_write_tokens tracked and billed at its own rate",
+            len(cw) == 1
+            and cw[0]["cache_write_tokens"] == 3
+            and cw[0]["cached_tokens"] == 4
+            and cw[0]["cost_usd"] is not None
+            and abs(cw[0]["cost_usd"] - mock_cw) < 1e-9,
+            str(cw),
+        )
+        check(
+            "usage: cache-write rate stored on the record",
+            (cw[0].get("rates") or {}).get("cache_write_input") == 0.0005,
+            str(cw[0].get("rates")),
+        )
+
+        # GET /v1/usage and /usage aggregation (seed + 7 tracked requests).
+        spent = (
+            49.9999 + mock_in + mock_nosplit + mock_gem + mock_in + mock_61 + mock_cw
+        )
         r = client3.get("/v1/usage")
         rep = r.json() if r.status_code == 200 else {}
         check("usage: GET /v1/usage -> 200", r.status_code == 200, r.text)
         check(
             "usage: month, request count and spend",
             rep.get("month") == month_now
-            and rep.get("requests") == 6
+            and rep.get("requests") == 8
             and abs(rep.get("spent_usd", 0) - spent) < 1e-6,
             str(rep),
         )
@@ -1519,7 +1575,9 @@ def main() -> int:
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
-                "claude-fable-5",
+                "gpt-6.1-sol",
+                "gpt-6-astra",
+                "claude-fable-5-1",
                 "gemini-3.8-flash",
             },
             str(rep.get("models")),
@@ -1532,7 +1590,7 @@ def main() -> int:
         r = client3.get("/usage")
         check(
             "usage: bare /usage aggregates the same",
-            r.status_code == 200 and r.json().get("requests") == 6,
+            r.status_code == 200 and r.json().get("requests") == 8,
             r.text,
         )
         r = client3.get("/v1/usage", params={"month": "2020-01"})

@@ -16,14 +16,16 @@ Exposed models (by default):
 | `gpt-6-astra`                 | `gpt-6-astra`  |
 | `gpt-6.1-sol`                 | `gpt-6.1-sol`  |
 | `gemini-3.8-flash`            | `gemini-3.8-flash` |
-| `claude-opus-4-8`             | `claude-opus-4-8` |
-| `claude-fable-5`              | `claude-fable-5` |
+| `claude-opus-5-5`             | `claude-opus-5-5` |
+| `claude-sonnet-5-5`           | `claude-sonnet-5-5` |
+| `claude-fable-5-1`            | `claude-fable-5-1` |
 
 The aliases are passed through to Portkey as-is. If an alias is not a real
 deployment name on the sandbox, map it to a real model by setting the matching
 `*_UPSTREAM_MODEL` variable (e.g. `GPT56_SOL_UPSTREAM_MODEL`,
 `GPT6_ASTRA_UPSTREAM_MODEL`, `GPT6_SOL_UPSTREAM_MODEL`, `GEMINI38_FLASH_UPSTREAM_MODEL`,
-`CLAUDE_OPUS_48_UPSTREAM_MODEL`, `CLAUDE_FABLE_5_UPSTREAM_MODEL`; or editing
+`CLAUDE_OPUS_55_UPSTREAM_MODEL`, `CLAUDE_SONNET_55_UPSTREAM_MODEL`,
+`CLAUDE_FABLE_51_UPSTREAM_MODEL`; or editing
 `MODEL_REGISTRY` in `proxy.py`) — e.g. `claude-sonnet-4-6`.
 
 ## Endpoints
@@ -100,7 +102,8 @@ export COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:8090/v1
 export COPILOT_PROVIDER_API_KEY=<your Portkey / AI Sandbox key>
 export COPILOT_MODEL=gpt-5.6-sol        # or gpt-5.6-terra / gpt-5.6-luna /
                                         # gpt-6-astra / gemini-3.8-flash /
-                                        # claude-opus-4-8 / claude-fable-5
+                                        # claude-opus-5-5 / claude-sonnet-5-5 /
+                                        # claude-fable-5-1
 copilot
 ```
 
@@ -209,8 +212,10 @@ Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
 ```json
 {"ts":"2026-09-16T09:51:02","month":"2026-09","model":"gpt-5.6-sol","upstream":"gpt-5.6-sol",
  "provider":"openai","pricing_model":"gpt-5.6-sol","stream":true,"prompt_tokens":12,
- "cached_tokens":4,"completion_tokens":8,"reasoning_tokens":0,"total_tokens":20,
- "rates":{"input":0.0004,"output":0.002,"cache_read_input":4e-05},"cost_usd":0.000198}
+ "cached_tokens":4,"cache_write_tokens":0,"completion_tokens":8,"reasoning_tokens":0,
+ "total_tokens":20,
+ "rates":{"input":0.0004,"output":0.002,"cache_read_input":4e-05,"cache_write_input":0.0005},
+ "cost_usd":0.0001936}
 ```
 
 - **Prices** come from `https://api.portkey.ai/model-configs/pricing/<provider>/<model>`
@@ -219,8 +224,38 @@ Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
   `cost_usd = tokens x price / 100`. Each record stores the rates applied, so
   history is auditable and never rewritten when prices change. Models with no
   catalog entry (the Sandbox deployment names differ, e.g. `gemini-3.8-flash`
-  is priced as `gemini-3.8-flash-gt-128k`) are recorded with `cost_usd: null`
-  and flagged in reports — requests are never blocked over tracking issues.
+  is priced as `gemini-3.8-flash-gt-128k` and `gpt-6.1-sol` as `gpt-6-sol`) are
+  recorded with `cost_usd: null` and flagged in reports — requests are never
+  blocked over tracking issues.
+- **Cost formula.** `cached_tokens` and `cache_write_tokens` are both subsets of
+  `prompt_tokens`, so input is split three ways and each part is billed at its
+  own catalog rate:
+
+  ```
+  plain        = prompt_tokens - cached_tokens - cache_write_tokens
+  cost_usd     = (plain            x input
+                + cache_write      x cache_write_input   # falls back to input
+                + cached           x cache_read_input    # falls back to input
+                + completion       x output) / 100
+  ```
+
+  Current catalog rates per 1M tokens (multiply the API value by 1e6/100):
+
+  | Model (as requested) | Priced as | Input | Cached in | Cache write | Output |
+  | ------------------------ | ----------- | -------: | -----------: | ------------: | -------: |
+  | `gpt-5.6-sol` | `gpt-5.6-sol` | $4.00 | $0.40 | $5.00 | $20.00 |
+  | `gpt-5.6-terra` | `gpt-5.6-terra` | $2.00 | $0.20 | $2.50 | $12.00 |
+  | `gpt-5.6-luna` | `gpt-5.6-luna` | $0.20 | $0.02 | $0.25 | $1.20 |
+  | `gpt-6-astra` | `gpt-6-astra` | $10.00 | $1.00 | $12.50 | $50.00 |
+  | `gpt-6.1-sol` | `gpt-6-sol` | $2.00 | $0.20 | $2.50 | $10.00 |
+  | `gemini-3.8-flash` | `gemini-3.8-flash-gt-128k` | $0.75 | $0.075 | – | $3.75 |
+  | `claude-opus-5-5` | `claude-opus-5-5` | $4.00 | $0.20 | $5.00 | $20.00 |
+  | `claude-sonnet-5-5` | `claude-sonnet-5-5` | $2.00 | $0.20 | $2.50 | $10.00 |
+  | `claude-fable-5-1` | `claude-fable-5-1` | $10.00 | $0.25 | $12.50 | $50.00 |
+
+  A dash means the catalog has no rate for that cell, so it falls back to the
+  plain input rate. Override a mapping with `<ALIAS>_PRICING_MODEL` (e.g.
+  `GPT6_SOL_PRICING_MODEL`) when the catalog renames a deployment.
 - **Budget warnings** are logged by the proxy when the running monthly total
   crosses $50 / $100 / $150 / $200 / $250, and when $25 or $10 remain.
   Tracking is observe-only: the proxy never rejects a request for budget.
@@ -257,7 +292,7 @@ disagree about it. Each model in `MODEL_REGISTRY` declares a profile from
 | --------- | -------- | ----------- |
 | `gpt-5.6` | `gpt-5.6-sol/terra/luna` | Rejects function `tools` + reasoning together. The proxy strips reasoning when tools are present, and auto-retries with `reasoning_effort: "none"` if the upstream still complains. `"none"` **is** a valid value here. (On `/v1/responses` this profile has no conflict — reasoning is forwarded untouched.) |
 | `gpt-6` | `gpt-6-astra`, `gpt-6.1-sol` | **No chat-completions shape accepts function tools at all** (see below), so tools-bearing requests are bridged via `/v1/responses` by default. Without tools, `"none"` is **not** a valid effort — supported values are `low`, `medium`, `high`, `xhigh`, and unsupported client values are rewritten to the fallback `low`. |
-| `flexible` | `gemini-3.8-flash` | Accepts tools + reasoning and its own effort vocabulary, so values are forwarded untouched unless you configure an explicit list. |
+| `flexible` | `gemini-3.8-flash`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1` | Accepts tools + reasoning and its own effort vocabulary, so values are forwarded untouched unless you configure an explicit list. |
 
 **"Function tools with reasoning_effort are not supported ... set reasoning_effort to 'none'"**
 
@@ -361,7 +396,7 @@ the banner (`Gateway timeout: ...`) or the started log to confirm.
 | `TOOLS_REASONING_EFFORT` | `strip` | For models that reject tools + reasoning (GPT-5.6 only): `strip`, `none`, or `keep` (the alternative is auto-tried on the upstream's tools+reasoning 400) |
 | `GPT56_SOL_UPSTREAM_MODEL` / `GPT56_TERRA_UPSTREAM_MODEL` / `GPT56_LUNA_UPSTREAM_MODEL` / `GPT6_ASTRA_UPSTREAM_MODEL` / `GPT6_SOL_UPSTREAM_MODEL` / `GEMINI38_FLASH_UPSTREAM_MODEL` | alias name | Map an alias to a different upstream model |
 | `GPT6_ASTRA_REASONING_EFFORTS` | `low,medium,high,xhigh` | Comma-separated `reasoning_effort` values the upstream accepts for `gpt-6-astra`; unsupported client values are rewritten to the first non-`none` entry |
-| `GEMINI38_FLASH_REASONING_EFFORTS` | – (unset) | Optional comma-separated `reasoning_effort` list for `gemini-3.8-flash`; when unset, client values are forwarded untouched |
+| `GEMINI38_FLASH_REASONING_EFFORTS` / `CLAUDE_OPUS_55_REASONING_EFFORTS` / `CLAUDE_SONNET_55_REASONING_EFFORTS` / `CLAUDE_FABLE_51_REASONING_EFFORTS` | – (unset) | Optional comma-separated `reasoning_effort` list for `gemini-3.8-flash` or a Claude model; when unset, client values are forwarded untouched |
 | `USAGE_TRACKING` | `1` | Record token usage and dollar cost of every request to the JSONL usage log |
 | `USAGE_LOG_PATH` | `usage.jsonl` (next to `proxy.py`) | Append-only usage log; also read directly by `usage_report.py` |
 | `MONTHLY_BUDGET_USD` | `250` | Monthly budget used by `/v1/usage` reports and the proxy's budget warning logs |

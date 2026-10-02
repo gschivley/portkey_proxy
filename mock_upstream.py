@@ -119,6 +119,8 @@ async def chat_completions(request: Request):
     mode = body.pop("mock_upstream_mode", None)
     # Test-only directive: report this many cached input tokens in usage.
     cached_tokens = body.pop("mock_cached_tokens", None)
+    # Test-only directive: report this many cache-write input tokens in usage.
+    cache_write_tokens = body.pop("mock_cache_write_tokens", None)
     _record(request, body)
     model = body.get("model", "unknown")
     now = int(time.time())
@@ -167,8 +169,13 @@ async def chat_completions(request: Request):
         "completion_tokens": 8,
         "total_tokens": 20,
     }
+    details: Dict[str, Any] = {}
     if cached_tokens is not None:
-        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+        details["cached_tokens"] = cached_tokens
+    if cache_write_tokens is not None:
+        details["cache_write_tokens"] = cache_write_tokens
+    if details:
+        usage["prompt_tokens_details"] = details
 
     if not body.get("stream"):
         return {

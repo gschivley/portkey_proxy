@@ -39,13 +39,13 @@ def main() -> int:
         return 0
 
     print(f"Usage report for {report['month']}  (log: {report['log_path']})")
-    print("=" * 78)
+    print("=" * 88)
     if not report["models"]:
         print("No usage recorded this month yet.")
     else:
         header = (
             f"{'model':<18}{'provider':<11}{'reqs':>6}{'input':>10}"
-            f"{'cached':>9}{'output':>10}{'cost $':>11}"
+            f"{'cached':>9}{'wr:cache':>9}{'output':>10}{'cost $':>11}"
         )
         print(header)
         print("-" * len(header))
@@ -53,7 +53,8 @@ def main() -> int:
             print(
                 f"{row['model']:<18}{str(row['provider'] or '-'):<11}"
                 f"{row['requests']:>6}{row['prompt_tokens']:>10}"
-                f"{row['cached_tokens']:>9}{row['completion_tokens']:>10}"
+                f"{row['cached_tokens']:>9}{row.get('cache_write_tokens', 0):>9}"
+                f"{row['completion_tokens']:>10}"
                 f"{row['cost_usd']:>11.4f}"
             )
         print("-" * len(header))

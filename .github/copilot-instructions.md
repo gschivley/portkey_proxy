@@ -19,7 +19,7 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the full integration test suite (162 checks; boots a mock upstream + the real proxy)
+# Run the full integration test suite (173 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -40,6 +40,9 @@ pip install -r requirements.txt
   call to `usage.jsonl` and emits budget-milestone warnings; `monthly_report()`
   aggregates by model for a `YYYY-MM` bucket. Cost formula:
   `tokens * price / 100` — the API returns the per-token USD price scaled x100.
+  Input is split three ways because `cached_tokens` and `cache_write_tokens` are
+  both *subsets* of `prompt_tokens`: plain input, cache-write and cache-read are
+  each billed at their own catalog rate (a missing rate falls back to plain input).
 - `usage_report.py` — CLI over the same JSONL log (works while the proxy is stopped).
 - `mock_upstream.py` — mock OpenAI-compatible upstream used by the tests. Records
   every request to `_captured.json` and supports test-only "personality" modes via
@@ -51,7 +54,8 @@ pip install -r requirements.txt
   streamed argument deltas) instead of a message. Also serves
   `GET /pricing/<provider>/<model>` (fixed `openai`/`google` rates; `anthropic`
   404s to exercise the no-pricing path) and honors a `mock_cached_tokens` field to
-  report cached input tokens in `usage`.
+  report cached input tokens in `usage` and a `mock_cache_write_tokens` field to
+  report cache-write input tokens.
 - `test_proxy.py` — end-to-end integration test: starts `mock_upstream.py` and
   `proxy.py` as subprocesses on free ports, drives them with `httpx`, asserts with
   `check()`. Section 7 covers `/v1/responses`; section 8 covers the
@@ -117,7 +121,8 @@ pip install -r requirements.txt
   (and the README table). Each entry also declares a `provider` (`openai`/
   `anthropic`/`google`) used for the pricing lookup; if the deployment's pricing
   name differs from its `upstream`, set a `pricing_model` (e.g. `gemini-3.8-flash`
-  → `gemini-3.8-flash-gt-128k`).
+  -> `gemini-3.8-flash-gt-128k`, `gpt-6.1-sol` -> `gpt-6-sol`; both 404 under
+  their deployment name and would otherwise log `cost_usd: null`).
 - **Reasoning is per-model, not global**: `REASONING_PROFILES` captures three
   upstream quirks:
   - `gpt-5.6` — upstream rejects function `tools` + reasoning together **on
@@ -170,4 +175,4 @@ pip install -r requirements.txt
   actually forwarded; it's gitignored and deleted at the end of the run.
 - Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log` (gitignored).
 - After changing proxy behavior, run `./.venv/bin/python test_proxy.py` and
-  confirm "ALL TESTS PASSED" (162 checks).
+  confirm "ALL TESTS PASSED" (173 checks).

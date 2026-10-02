@@ -223,9 +223,18 @@ def extract_tokens(usage: Dict[str, Any]) -> Dict[str, int]:
     reasoning = (
         _to_int(cdetails.get("reasoning_tokens")) if isinstance(cdetails, dict) else 0
     )
+    # Cache-write tokens are part of the non-cached input (they are being
+    # written now rather than read back) and are priced differently from both.
+    cache_write = (
+        _to_int(details.get("cache_write_tokens"))
+        if isinstance(details, dict)
+        else 0
+    )
+    cache_write = min(cache_write, max(prompt - cached, 0))
     return {
         "prompt_tokens": prompt,
         "cached_tokens": cached,
+        "cache_write_tokens": cache_write,
         "completion_tokens": completion,
         "reasoning_tokens": reasoning,
         "total_tokens": total,
@@ -233,13 +242,23 @@ def extract_tokens(usage: Dict[str, Any]) -> Dict[str, int]:
 
 
 def compute_cost(rates: Dict[str, float], tokens: Dict[str, int]) -> float:
-    """USD cost for one call: (uncached input + cache-read + output) / scale."""
-    uncached = tokens["prompt_tokens"] - tokens["cached_tokens"]
+    """USD cost for one call: plain input + cache-write + cache-read + output.
+
+    `cached_tokens` and `cache_write_tokens` are both subsets of
+    `prompt_tokens`, so the plain-input term is whatever is left after both.
+    A model whose catalog entry has no cache-write rate bills those tokens at
+    the plain input rate, which is what happened before the rate was tracked.
+    """
+    cached = tokens["cached_tokens"]
+    cache_write = tokens.get("cache_write_tokens", 0)
+    plain = max(tokens["prompt_tokens"] - cached - cache_write, 0)
     input_rate = rates.get("input", 0.0)
     cache_rate = rates.get("cache_read_input", input_rate)
+    write_rate = rates.get("cache_write_input", input_rate)
     cost = (
-        uncached * input_rate
-        + tokens["cached_tokens"] * cache_rate
+        plain * input_rate
+        + cache_write * write_rate
+        + cached * cache_rate
         + tokens["completion_tokens"] * rates.get("output", 0.0)
     ) / PRICE_SCALE
     return round(cost, 8)
@@ -395,6 +414,7 @@ def monthly_report(month: Optional[str] = None) -> Dict[str, Any]:
                 "requests": 0,
                 "prompt_tokens": 0,
                 "cached_tokens": 0,
+                "cache_write_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
                 "cost_usd": 0.0,
@@ -405,6 +425,7 @@ def monthly_report(month: Optional[str] = None) -> Dict[str, Any]:
         for field in (
             "prompt_tokens",
             "cached_tokens",
+            "cache_write_tokens",
             "completion_tokens",
             "total_tokens",
         ):
