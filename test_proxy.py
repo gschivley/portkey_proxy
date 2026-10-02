@@ -5,7 +5,7 @@ End-to-end integration test for proxy.py.
 Boots a mock Portkey-compatible upstream (mock_upstream.py) and the real
 proxy (proxy.py) as subprocesses, then verifies:
 
-  - model listing (gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna)
+  - model listing (gpt-5.6-sol / gpt-5.6-terra / gpt-6-luna)
   - non-streaming chat completions (JSON shape, alias -> upstream rewrite,
     auth injection, parameter forwarding, usage metadata)
   - streaming chat completions (SSE chunks, [DONE], final usage)
@@ -124,7 +124,7 @@ def main() -> int:
             "PORTKEY_BASE_URL": f"http://127.0.0.1:{mock_port}",  # no /v1: proxy must normalize
             "GPT56_SOL_UPSTREAM_MODEL": "upstream-sol",
             "GPT56_TERRA_UPSTREAM_MODEL": "upstream-terra",
-            "GPT56_LUNA_UPSTREAM_MODEL": "upstream-luna",
+            "GPT6_LUNA_UPSTREAM_MODEL": "upstream-luna",
             "GPT6_ASTRA_UPSTREAM_MODEL": "upstream-astra",
             "GEMINI38_FLASH_UPSTREAM_MODEL": "upstream-gemini",
             "CLAUDE_OPUS_55_UPSTREAM_MODEL": "upstream-opus",
@@ -165,7 +165,7 @@ def main() -> int:
             r.status_code == 200
             and "gpt-5.6-sol" in ids
             and "gpt-5.6-terra" in ids
-            and "gpt-5.6-luna" in ids
+            and "gpt-6-luna" in ids
             and "gpt-6-astra" in ids
             and "gpt-6.1-sol" in ids
             and "gemini-3.8-flash" in ids
@@ -351,25 +351,74 @@ def main() -> int:
             str(cap["body"].get("reasoning_effort")),
         )
 
-        # 2c. gpt-5.6-luna ------------------------------------------------
+        # 2c. gpt-6-luna ---------------------------------------------------
         r = client.post(
             "/v1/chat/completions",
             json={
-                "model": "gpt-5.6-luna",
+                "model": "gpt-6-luna",
                 "messages": [{"role": "user", "content": "Hi"}],
             },
         )
-        check("gpt-5.6-luna -> 200", r.status_code == 200, r.text)
+        check("gpt-6-luna -> 200", r.status_code == 200, r.text)
         check(
-            "gpt-5.6-luna client-facing model",
-            r.json().get("model") == "gpt-5.6-luna",
+            "gpt-6-luna client-facing model",
+            r.json().get("model") == "gpt-6-luna",
             r.text,
         )
         cap = json.loads(CAPTURE.read_text())
         check(
-            "gpt-5.6-luna mapped to upstream-luna",
+            "gpt-6-luna mapped to upstream-luna",
             cap["body"].get("model") == "upstream-luna",
             str(cap["body"].get("model")),
+        )
+
+        # gpt-6-luna is named like the gpt-6 family but behaves like GPT-5.6
+        # (verified live 2026-10-02): 'none' is a valid effort and function
+        # tools work on chat once reasoning is "none". So tools + reasoning is
+        # stripped, and against an upstream that demands an explicit "none" the
+        # retry ladder satisfies it -- no /v1/responses bridging.
+        luna_tools = {
+            "model": "gpt-6-luna",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": req_body["tools"],
+            "reasoning_effort": "high",
+        }
+        r = client.post("/v1/chat/completions", json=luna_tools)
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "gpt-6-luna: tools + reasoning -> 200 with reasoning stripped",
+            r.status_code == 200 and "reasoning_effort" not in cap["body"],
+            str(cap["body"].get("reasoning_effort")),
+        )
+        check(
+            "gpt-6-luna: served on chat, not bridged to responses",
+            "messages" in cap["body"] and "input" not in cap["body"],
+            str(sorted(cap["body"])),
+        )
+        r = client.post(
+            "/v1/chat/completions",
+            json={**luna_tools, "mock_upstream_mode": "reject_tools_unless_none"},
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "gpt-6-luna: auto-retries with reasoning_effort=none",
+            r.status_code == 200 and cap["body"].get("reasoning_effort") == "none",
+            str(cap["body"].get("reasoning_effort")),
+        )
+        # 'none' is valid here (unlike astra), so it must survive untouched.
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-6-luna",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "reasoning_effort": "none",
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "gpt-6-luna: reasoning_effort=none forwarded (valid effort)",
+            r.status_code == 200 and cap["body"].get("reasoning_effort") == "none",
+            str(cap["body"].get("reasoning_effort")),
         )
 
         # 2d. gpt-6-astra / gemini: reasoning is model-specific -------------
@@ -1477,13 +1526,13 @@ def main() -> int:
         r = client3.post(
             "/v1/responses",
             json={
-                "model": "gpt-5.6-luna",
+                "model": "gpt-6-luna",
                 "input": "Hi",
                 "mock_cached_tokens": 4,
             },
         )
         check("usage: responses request ok", r.status_code == 200, r.text)
-        luna = [x for x in usage_records() if x["model"] == "gpt-5.6-luna"]
+        luna = [x for x in usage_records() if x["model"] == "gpt-6-luna"]
         check("usage: responses recorded once", len(luna) == 1, str(len(luna)))
         if luna:
             ln = luna[0]
@@ -1579,7 +1628,7 @@ def main() -> int:
                 "seed-model",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
-                "gpt-5.6-luna",
+                "gpt-6-luna",
                 "gpt-6.1-sol",
                 "gpt-6-astra",
                 "claude-fable-5-1",

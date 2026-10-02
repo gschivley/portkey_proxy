@@ -12,9 +12,9 @@ Exposed models (by default):
 |-------------------------------|----------------|
 | `gpt-5.6-sol`                 | `gpt-5.6-sol`  |
 | `gpt-5.6-terra`               | `gpt-5.6-terra`|
-| `gpt-5.6-luna`                | `gpt-5.6-luna` |
 | `gpt-6-astra`                 | `gpt-6-astra`  |
 | `gpt-6.1-sol`                 | `gpt-6.1-sol`  |
+| `gpt-6-luna`                  | `gpt-6-luna`   |
 | `gemini-3.8-flash`            | `gemini-3.8-flash` |
 | `claude-opus-5-5`             | `claude-opus-5-5` |
 | `claude-sonnet-5-5`           | `claude-sonnet-5-5` |
@@ -131,10 +131,10 @@ For GitHub Copilot CLI the same settings map to environment variables:
 export COPILOT_PROVIDER_TYPE=openai
 export COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:8090/v1
 export COPILOT_PROVIDER_API_KEY=<your Portkey / AI Sandbox key>
-export COPILOT_MODEL=gpt-5.6-sol        # or gpt-5.6-terra / gpt-5.6-luna /
-                                        # gpt-6-astra / gemini-3.8-flash /
-                                        # claude-opus-5-5 / claude-sonnet-5-5 /
-                                        # claude-fable-5-1
+export COPILOT_MODEL=gpt-5.6-sol        # or gpt-5.6-terra / gpt-6-astra /
+                                        # gpt-6.1-sol / gpt-6-luna /
+                                        # gemini-3.8-flash / claude-opus-5-5 /
+                                        # claude-sonnet-5-5 / claude-fable-5-1
 copilot
 ```
 
@@ -162,8 +162,8 @@ form, so the client still sees an ordinary `chat.completion`. See
 | Input | `messages` | `input` (a plain `messages` array is converted when it maps cleanly) |
 | Function tools | nested: `{"type":"function","function":{...}}` | **flat**: `{"type":"function","name":...,"parameters":...}` |
 | Reasoning | `reasoning_effort` (flat) | `reasoning: {"effort": ...}` (nested) |
-| Tools + reasoning on GPT-5.6 | **rejected upstream** — reasoning is stripped, with an auto-retry using `"none"` | **accepted**, reasoning forwarded untouched |
-| Tools on the gpt-6 family | **rejected in every shape** — auto-bridged via Responses | **accepted** natively |
+| Tools + reasoning on GPT-5.6 profile (`gpt-5.6-sol/terra`, `gpt-6-luna`) | **rejected upstream** — reasoning is stripped, with an auto-retry using `"none"` | **accepted**, reasoning forwarded untouched |
+| Tools on the gpt-6 profile (`gpt-6-astra`, `gpt-6.1-sol`) | **rejected in every shape** — auto-bridged via Responses | **accepted** natively |
 | NRP models (`qwen3`, `deepseek-v4-flash`, `glm-5`) | **accepted** natively | **broken upstream** — auto-bridged via chat completions (`responses_via_chat`) |
 | Stream terminator | `data: [DONE]` | `response.completed` event (no `[DONE]`) |
 | Usage fields | `prompt_tokens` / `completion_tokens` | `input_tokens` / `output_tokens` (normalised into the same `usage.jsonl` schema) |
@@ -277,9 +277,9 @@ Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
   | ------------------------ | ----------- | -------: | -----------: | ------------: | -------: |
   | `gpt-5.6-sol` | `gpt-5.6-sol` | $4.00 | $0.40 | $5.00 | $20.00 |
   | `gpt-5.6-terra` | `gpt-5.6-terra` | $2.00 | $0.20 | $2.50 | $12.00 |
-  | `gpt-5.6-luna` | `gpt-5.6-luna` | $0.20 | $0.02 | $0.25 | $1.20 |
   | `gpt-6-astra` | `gpt-6-astra` | $10.00 | $1.00 | $12.50 | $50.00 |
   | `gpt-6.1-sol` | `gpt-6-sol` | $2.00 | $0.20 | $2.50 | $10.00 |
+  | `gpt-6-luna` | `gpt-6-luna` | $0.01 | $0.001 | $0.0125 | $0.05 |
   | `gemini-3.8-flash` | `gemini-3.8-flash-gt-128k` | $0.75 | $0.075 | – | $3.75 |
   | `claude-opus-5-5` | `claude-opus-5-5` | $4.00 | $0.20 | $5.00 | $20.00 |
   | `claude-sonnet-5-5` | `claude-sonnet-5-5` | $2.00 | $0.20 | $2.50 | $10.00 |
@@ -322,7 +322,7 @@ disagree about it. Each model in `MODEL_REGISTRY` declares a profile from
 
 | Profile | Models | Behaviour on `/v1/chat/completions` |
 | --------- | -------- | ----------- |
-| `gpt-5.6` | `gpt-5.6-sol/terra/luna` | Rejects function `tools` + reasoning together. The proxy strips reasoning when tools are present, and auto-retries with `reasoning_effort: "none"` if the upstream still complains. `"none"` **is** a valid value here. (On `/v1/responses` this profile has no conflict — reasoning is forwarded untouched.) |
+| `gpt-5.6` | `gpt-5.6-sol/terra`, `gpt-6-luna` | Rejects function `tools` + reasoning together. The proxy strips reasoning when tools are present, and auto-retries with `reasoning_effort: "none"` if the upstream still complains. `"none"` **is** a valid value here. (On `/v1/responses` this profile has no conflict — reasoning is forwarded untouched.) Despite its name, `gpt-6-luna` behaves like this family, not the `gpt-6` one. |
 | `gpt-6` | `gpt-6-astra`, `gpt-6.1-sol` | **No chat-completions shape accepts function tools at all** (see below), so tools-bearing requests are bridged via `/v1/responses` by default. Without tools, `"none"` is **not** a valid effort — supported values are `low`, `medium`, `high`, `xhigh`, and unsupported client values are rewritten to the fallback `low`. |
 | `flexible` | `gemini-3.8-flash`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1` | Accepts tools + reasoning and its own effort vocabulary, so values are forwarded untouched unless you configure an explicit list. |
 
@@ -428,7 +428,7 @@ the banner (`Gateway timeout: ...`) or the started log to confirm.
 | `RESPONSES_ENABLED` | `1` | Serve `POST /v1/responses`. Set `0` to disable it (the route then returns a 404 stub, and bridging is disabled too) |
 | `TOOLS_VIA_RESPONSES` | `auto` | Serve chat requests with function tools through the Responses API and translate the reply back: `auto` (only models with no working chat shape for tools, i.e. the `gpt-6` family), `always` (also GPT-5.6, preserving its reasoning), `never` (forward the upstream 400) |
 | `TOOLS_REASONING_EFFORT` | `strip` | For models that reject tools + reasoning (GPT-5.6 only): `strip`, `none`, or `keep` (the alternative is auto-tried on the upstream's tools+reasoning 400) |
-| `GPT56_SOL_UPSTREAM_MODEL` / `GPT56_TERRA_UPSTREAM_MODEL` / `GPT56_LUNA_UPSTREAM_MODEL` / `GPT6_ASTRA_UPSTREAM_MODEL` / `GPT6_SOL_UPSTREAM_MODEL` / `GEMINI38_FLASH_UPSTREAM_MODEL` | alias name | Map an alias to a different upstream model |
+| `GPT56_SOL_UPSTREAM_MODEL` / `GPT56_TERRA_UPSTREAM_MODEL` / `GPT6_ASTRA_UPSTREAM_MODEL` / `GPT6_SOL_UPSTREAM_MODEL` / `GPT6_LUNA_UPSTREAM_MODEL` / `GEMINI38_FLASH_UPSTREAM_MODEL` | alias name | Map an alias to a different upstream model |
 | `QWEN3_UPSTREAM_MODEL` / `DEEPSEEK_V4_FLASH_UPSTREAM_MODEL` / `GLM5_UPSTREAM_MODEL` | alias name | Map an NRP alias to a different upstream model |
 | `GPT6_ASTRA_REASONING_EFFORTS` | `low,medium,high,xhigh` | Comma-separated `reasoning_effort` values the upstream accepts for `gpt-6-astra`; unsupported client values are rewritten to the first non-`none` entry |
 | `GEMINI38_FLASH_REASONING_EFFORTS` / `CLAUDE_OPUS_55_REASONING_EFFORTS` / `CLAUDE_SONNET_55_REASONING_EFFORTS` / `CLAUDE_FABLE_51_REASONING_EFFORTS` | – (unset) | Optional comma-separated `reasoning_effort` list for `gemini-3.8-flash` or a Claude model; when unset, client values are forwarded untouched |

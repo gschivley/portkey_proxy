@@ -19,7 +19,7 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the full integration test suite (208 checks; boots a mock upstream + the real proxy)
+# Run the full integration test suite (212 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -118,8 +118,10 @@ pip install -r requirements.txt
   translated **back** into `chat.completion` / chat SSE by
   `_chat_to_responses_kwargs`, `_responses_to_chat_completion` and
   `_ResponsesToChatSSE`, so the client never knows. `auto` bridges only models
-  with `tools_on_chat: False` (the gpt-6 family, which rejects tools on chat in
-  every shape); `always` also bridges GPT-5.6 (preserving its reasoning);
+  with `tools_on_chat: False` (the `gpt-6` profile — `gpt-6-astra` and
+  `gpt-6.1-sol` — which reject tools on chat in every shape; note `gpt-6-luna`
+  is named like this family but uses the `gpt-5.6` profile and is not bridged);
+  `always` also bridges GPT-5.6 (preserving its reasoning);
   `never` forwards the upstream 400. Requires `RESPONSES_ENABLED=1`. Log line:
   `chat request bridged via responses: ...`.
   Responses gotchas: function tools are **flat**
@@ -153,6 +155,9 @@ pip install -r requirements.txt
     `TOOLS_REASONING_EFFORT` (`strip`/`none`/`keep`) controls the first attempt;
     if the upstream still returns the tools+reasoning 400, the proxy auto-retries
     once with the alternative variant (both streaming and non-streaming).
+    `gpt-6-luna` uses this profile despite its name (verified live 2026-10-02:
+    `"none"` is a valid effort and tools work on chat once reasoning is `"none"`,
+    so no bridging is needed).
   - `gpt-6` — **`tools_on_chat: False`**: rejects function tools on chat
     completions in *every* shape (tools+reasoning 400s; `"none"` 400s because it
     is not a valid effort; omitting reasoning still 400s as the upstream applies
@@ -198,4 +203,4 @@ pip install -r requirements.txt
   actually forwarded; it's gitignored and deleted at the end of the run.
 - Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log` (gitignored).
 - After changing proxy behavior, run `./.venv/bin/python test_proxy.py` and
-  confirm "ALL TESTS PASSED" (208 checks).
+  confirm "ALL TESTS PASSED" (212 checks).

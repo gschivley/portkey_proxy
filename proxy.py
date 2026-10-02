@@ -66,9 +66,9 @@ Configuration (local .env file next to this script, or environment):
                            RESPONSES_ENABLED=1.
     GPT56_SOL_UPSTREAM_MODEL     optional upstream model for gpt-5.6-sol
     GPT56_TERRA_UPSTREAM_MODEL   optional upstream model for gpt-5.6-terra
-    GPT56_LUNA_UPSTREAM_MODEL   optional upstream model for gpt-5.6-luna
     GPT6_ASTRA_UPSTREAM_MODEL    optional upstream model for gpt-6-astra
     GPT6_SOL_UPSTREAM_MODEL      optional upstream model for gpt-6.1-sol
+    GPT6_LUNA_UPSTREAM_MODEL     optional upstream model for gpt-6-luna
     GEMINI38_FLASH_UPSTREAM_MODEL  optional upstream model for gemini-3.8-flash
     CLAUDE_OPUS_55_UPSTREAM_MODEL     optional upstream model for claude-opus-5-5
     CLAUDE_SONNET_55_UPSTREAM_MODEL   optional upstream model for claude-sonnet-5-5
@@ -296,8 +296,13 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "reasoning": "gpt-5.6",
         "provider": "openai",
     },
-    "gpt-5.6-luna": {
-        "upstream": os.environ.get("GPT56_LUNA_UPSTREAM_MODEL", "gpt-5.6-luna"),
+    # Named gpt-6 but behaves like the GPT-5.6 family (verified live 2026-10-02):
+    # it accepts reasoning_effort="none" (astra/6.1-sol reject it) and takes
+    # function tools on /v1/chat/completions once reasoning is set to "none",
+    # so the strip -> none retry ladder works here and no bridging is needed.
+    # Its advertised effort vocabulary is exactly the gpt-5.6 profile's.
+    "gpt-6-luna": {
+        "upstream": os.environ.get("GPT6_LUNA_UPSTREAM_MODEL", "gpt-6-luna"),
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-5.6",
         "provider": "openai",
