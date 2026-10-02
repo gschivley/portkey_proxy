@@ -2107,10 +2107,13 @@ def main() -> int:
             "responses request bridged via chat" in p4log,
             p4log[-300:],
         )
+        # Match the actual 403 signals (httpx's "403 Forbidden" response line,
+        # the proxy's "status=403" warning). A bare "403" substring false-positives
+        # on uvicorn PIDs/ports, e.g. "Started server process [40363]".
         check(
             "nrp: no 403 in proxy log",
-            "403" not in p4log,
-            [ln for ln in p4log.splitlines() if "403" in ln][:3],
+            "403 Forbidden" not in p4log and "status=403" not in p4log,
+            [ln for ln in p4log.splitlines() if "403 Forbidden" in ln or "status=403" in ln][:3],
         )
 
         client4.close()
