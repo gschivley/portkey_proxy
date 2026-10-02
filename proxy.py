@@ -107,12 +107,14 @@ Run:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import os
 import re
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
@@ -122,6 +124,10 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from portkey_ai import Portkey
+from portkey_ai._vendor.openai import OpenAI
+from portkey_ai._vendor.openai.resources.chat.completions.completions import (
+    Completions as _VendoredChatCompletions,
+)
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -164,6 +170,21 @@ _raw_base_url = os.environ.get("PORTKEY_BASE_URL") or "https://api.portkey.ai/v1
 PORTKEY_BASE_URL = _raw_base_url.rstrip("/")
 if not re.search(r"/v\d+$", PORTKEY_BASE_URL):
     PORTKEY_BASE_URL += "/v1"
+
+# NRP gateway: a separate OpenAI-compatible upstream (https://ellm.nrp-nautilus.io)
+# that serves its own models (qwen3, deepseek-v4-flash, glm-5). Unlike Portkey,
+# NRP uses a fixed API key from the environment (NRP_API_KEY) that is not
+# taken from the request, and it authenticates with standard
+# `Authorization: Bearer <key>` — the Portkey SDK masks that header and sends
+# the key as `x-portkey-api-key` instead, which the NRP gateway rejects with
+# 403. NRP requests therefore go through a plain OpenAI SDK client (see
+# get_nrp_client). NRP models are zero-cost, so they are never recorded in the
+# usage report (see the track_usage flag on MODEL_REGISTRY entries).
+NRP_BASE_URL = (os.environ.get("NRP_BASE_URL") or "https://ellm.nrp-nautilus.io/v1").rstrip("/")
+if not re.search(r"/v\d+$", NRP_BASE_URL):
+    NRP_BASE_URL += "/v1"
+NRP_API_KEY = os.environ.get("NRP_API_KEY", "").strip()
+
 PROXY_HOST = os.environ.get("PROXY_HOST", "127.0.0.1")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8090"))
 # Per-request upstream timeout sent to the Portkey gateway, in MILLISECONDS
@@ -333,6 +354,38 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "reasoning": "flexible",
         "efforts_env": "CLAUDE_FABLE_51_REASONING_EFFORTS",
         "provider": "anthropic",
+    },
+    # NRP gateway models. api_source routes them to NRP_BASE_URL with the
+    # NRP_API_KEY (not the per-request key); track_usage=False keeps them out
+    # of the usage/cost report because they are zero-cost.
+    "qwen3": {
+        "upstream": os.environ.get("QWEN3_UPSTREAM_MODEL", "qwen3"),
+        "description": "Qwen3 via the NRP gateway (zero-cost, not usage-tracked)",
+        "reasoning": "flexible",
+        "api_source": "nrp",
+        "responses_via_chat": True,
+        "track_usage": False,
+        "provider": "openai",
+    },
+    "deepseek-v4-flash": {
+        "upstream": os.environ.get(
+            "DEEPSEEK_V4_FLASH_UPSTREAM_MODEL", "deepseek-v4-flash"
+        ),
+        "description": "DeepSeek V4 Flash via the NRP gateway (zero-cost, not usage-tracked)",
+        "reasoning": "flexible",
+        "api_source": "nrp",
+        "responses_via_chat": True,
+        "track_usage": False,
+        "provider": "openai",
+    },
+    "glm-5": {
+        "upstream": os.environ.get("GLM5_UPSTREAM_MODEL", "glm-5"),
+        "description": "GLM-5 via the NRP gateway (zero-cost, not usage-tracked)",
+        "reasoning": "flexible",
+        "api_source": "nrp",
+        "responses_via_chat": True,
+        "track_usage": False,
+        "provider": "openai",
     },
 }
 
@@ -1121,6 +1174,571 @@ class _ResponsesToChatSSE:
 
 
 # --------------------------------------------------------------------------- #
+# Reverse bridge: serve /v1/responses traffic through chat completions
+# --------------------------------------------------------------------------- #
+# The NRP gateway (ellm.nrp-nautilus.io) exposes /v1/responses but does not
+# implement it: the Responses body fails its chat-shaped validation with a
+# 400 ("chat-completions request must have at least one message"). Copilot
+# speaks the Responses API, so for entries with `responses_via_chat` the
+# proxy converts the request into chat-completions kwargs, calls the chat
+# endpoint, and translates the reply (JSON or SSE) back into Responses
+# shapes. Clients keep talking Responses and never learn the difference.
+# --------------------------------------------------------------------------- #
+
+
+# Responses parameters with no chat-completions equivalent: dropped (logged).
+_NRP_DROPPED_PARAMS = (
+    "store",
+    "background",
+    "include",
+    "prompt",
+    "prompt_cache_key",
+    "safety_identifier",
+    "service_tier",
+    "truncation",
+    "max_tool_output_tokens",
+    "top_logprobs",
+    "previous_response_id",
+)
+
+
+def _responses_content_to_chat_parts(content: Any) -> List[Dict[str, Any]]:
+    """Map Responses message content parts onto their chat equivalents."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    parts: List[Dict[str, Any]] = []
+    for part in content or []:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        text = part.get("text") or part.get("refusal") or ""
+        if ptype in ("input_text", "output_text", "text"):
+            parts.append({"type": "text", "text": text})
+        elif ptype == "refusal":
+            parts.append({"type": "refusal", "refusal": part.get("refusal") or ""})
+        elif ptype in ("input_image", "image_url"):
+            image = (
+                part.get("image_url")
+                if isinstance(part.get("image_url"), dict)
+                else {"url": part.get("image_url") or part.get("image") or ""}
+            )
+            parts.append({"type": "image_url", "image_url": image})
+        elif ptype in ("input_audio", "audio"):
+            parts.append({"type": "input_audio", "input_audio": part.get("input_audio") or part.get("audio") or {}})
+        elif ptype in ("file", "input_file"):
+            parts.append({"type": "image_url", "image_url": part.get("file") or {}})
+    return parts
+
+
+def _responses_input_to_messages(
+    inp: Any, notes: List[str]
+) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    """Convert Responses `input` into chat `messages`.
+
+    Returns (messages, tool_call_id -> function name), the map used to
+    re-attach `name` to tool results when converting back.
+    """
+    if inp is None:
+        return [], {}
+    if isinstance(inp, str):
+        return [{"role": "user", "content": inp}], {}
+    if not isinstance(inp, list):
+        raise ApiError(
+            400,
+            "The NRP bridge expects 'input' to be a string or an array of "
+            "Responses items.",
+            param="input",
+            code="unsupported_input_shape",
+        )
+    messages: List[Dict[str, Any]] = []
+    call_names: Dict[str, str] = {}
+    for item in inp:
+        if not isinstance(item, dict):
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+            continue
+        itype = item.get("type")
+        role = item.get("role") or "user"
+        if itype in (None, "message"):
+            messages.append(
+                {
+                    "role": role,
+                    "content": _responses_content_to_chat_parts(
+                        item.get("content")
+                    ),
+                }
+            )
+        elif itype == "function_call":
+            call_id = item.get("call_id") or item.get("id") or f"call_{len(call_names)}"
+            call_names[call_id] = item.get("name", "")
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name", ""),
+                                "arguments": item.get("arguments") or "{}",
+                            },
+                        }
+                    ],
+                }
+            )
+        elif itype == "function_call_output":
+            call_id = item.get("call_id") or "call_unknown"
+            out = item.get("output")
+            msg: Dict[str, Any] = {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": out if isinstance(out, str) else json.dumps(out),
+            }
+            if item.get("name") or call_names.get(call_id):
+                msg["name"] = item.get("name") or call_names[call_id]
+            messages.append(msg)
+        elif itype == "item_reference":
+            notes.append("dropped item_reference input")
+        elif itype in ("reasoning", "local_shell_call", "web_search_call", "compaction"):
+            notes.append(f"dropped '{itype}' input item")
+        else:
+            notes.append(f"dropped unknown input item '{itype}'")
+    return messages, call_names
+
+
+def _responses_tool_to_chat(tool: Any) -> Any:
+    """Re-nest a flat Responses function tool into the chat shape."""
+    if isinstance(tool, dict) and tool.get("type") == "function" and "name" in tool:
+        inner = {k: v for k, v in tool.items() if k != "type"}
+        return {"type": "function", "function": inner}
+    return tool
+
+
+def _responses_to_chat_kwargs(
+    body: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, str], Optional[str]]:
+    """Translate a /v1/responses request body into chat-completions kwargs.
+
+    Returns (kwargs, tool_call_names, note). `tool_call_names` maps call ids
+    to function names for converting assistant function_call inputs.
+    """
+    kwargs: Dict[str, Any] = {}
+    notes: List[str] = []
+    call_names: Dict[str, str] = {}
+
+    inp = body.get("input")
+    messages, call_names = _responses_input_to_messages(inp, notes)
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        messages.insert(0, {"role": "system", "content": instructions})
+    if messages:
+        kwargs["messages"] = messages
+
+    for key, value in body.items():
+        if key in ("model", "stream", "input", "instructions"):
+            continue
+        if key in _NRP_DROPPED_PARAMS:
+            notes.append(f"dropped {key}")
+        elif key == "tools":
+            kwargs["tools"] = [_responses_tool_to_chat(t) for t in value] if isinstance(value, list) else value
+        elif key == "tool_choice":
+            if isinstance(value, dict) and value.get("type") == "function":
+                kwargs["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": value.get("name", "")},
+                }
+            elif isinstance(value, dict) and value.get("type") in (
+                "shell",
+                "custom",
+                "file_search",
+                "web_search_preview",
+            ):
+                raise ApiError(
+                    400,
+                    f"The NRP bridge cannot map tool_choice {value.get('type')!r} "
+                    "onto chat completions.",
+                    param="tool_choice",
+                    code="unsupported_tool_choice",
+                )
+            else:
+                kwargs["tool_choice"] = value
+        elif key == "max_output_tokens":
+            kwargs["max_completion_tokens"] = value
+        elif key == "reasoning":
+            effort = value.get("effort") if isinstance(value, dict) else None
+            if effort is not None and effort != "none":
+                kwargs["reasoning_effort"] = effort
+            elif effort == "none":
+                notes.append("dropped reasoning.effort=none")
+        elif key == "text":
+            fmt = value.get("format") if isinstance(value, dict) else None
+            if isinstance(fmt, dict) and fmt.get("type") in ("json_object", "json_schema"):
+                kwargs["response_format"] = dict(fmt)
+            else:
+                notes.append("dropped text")
+        elif key == "metadata" and isinstance(value, dict):
+            # Chat only accepts string-valued metadata; keep it if it fits.
+            if all(isinstance(v, str) for v in value.values()):
+                kwargs["metadata"] = value
+            else:
+                notes.append("dropped metadata (non-string values)")
+        else:
+            kwargs[key] = value  # temperature, top_p, user, stop, ...
+    if not kwargs.get("messages"):
+        raise ApiError(
+            400,
+            "The NRP bridge needs 'input' (or 'instructions') to build chat "
+            "messages; the request carried neither.",
+            param="input",
+        )
+    return kwargs, call_names, "; ".join(notes) or None
+
+
+def _chat_message_to_output_items(
+    message: Dict[str, Any], item_id_prefix: str = "msg"
+) -> List[Dict[str, Any]]:
+    """Split a chat assistant message into Responses output items."""
+    items: List[Dict[str, Any]] = []
+    text = message.get("content")
+    reasoning = message.get("reasoning_content") or message.get("reasoning")
+    if reasoning and not text and not message.get("tool_calls"):
+        # Reasoning-only turns carry no user-visible output in Responses.
+        text = None
+    if text:
+        items.append(
+            {
+                "id": f"{item_id_prefix}_0",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "logprobs": []}],
+            }
+        )
+    for i, call in enumerate(message.get("tool_calls") or []):
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") or {}
+        call_id = call.get("id") or f"call_{i}"
+        items.append(
+            {
+                "id": f"fc_{call_id}",
+                "type": "function_call",
+                "call_id": call_id,
+                "name": fn.get("name", ""),
+                "arguments": fn.get("arguments") or "",
+                "status": "completed",
+            }
+        )
+    return items
+
+
+def _chat_usage_to_responses(usage: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(usage, dict) or not usage:
+        return None
+    out = {
+        "input_tokens": usage.get("prompt_tokens", 0),
+        "output_tokens": usage.get("completion_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+    }
+    for src, dst in (
+        ("prompt_tokens_details", "input_tokens_details"),
+        ("completion_tokens_details", "output_tokens_details"),
+    ):
+        if isinstance(usage.get(src), dict):
+            out[dst] = dict(usage[src])
+    return out
+
+
+def _chat_to_responses_completion(data: Dict[str, Any], alias: str) -> Dict[str, Any]:
+    """Convert a chat.completion body into a Responses `response` object."""
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    output = _chat_message_to_output_items(message)
+    finish = choice.get("finish_reason")
+    status = "incomplete" if finish == "length" else "completed"
+    created = data.get("created")
+    return {
+        "id": data.get("id") or f"resp_{uuid.uuid4().hex}",
+        "object": "response",
+        "created_at": int(created) if isinstance(created, (int, float)) else int(time.time()),
+        "status": status,
+        "model": alias,
+        "output": output,
+        "output_text": _chat_message_text(message),
+        "error": None,
+        "incomplete_details": (
+            {"reason": "max_output_tokens"} if status == "incomplete" else None
+        ),
+        "usage": _chat_usage_to_responses(data.get("usage")),
+    }
+
+
+def _chat_message_text(message: Dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    return ""
+
+
+class _ChatToResponsesSSE:
+    """Stateful translator: chat.completion SSE chunks -> Responses events.
+
+    Reproduces the event sequence a Responses stream sends: response.created,
+    response.in_progress, message/function-call items with text and argument
+    deltas, their done events, and a final response.completed carrying usage.
+    No `data: [DONE]` sentinel (Responses streams do not use one).
+    """
+
+    def __init__(self, alias: str, upstream: str) -> None:
+        self.alias = alias
+        self.upstream = upstream
+        self.response_id = f"resp_{uuid.uuid4().hex}"
+        self.created = int(time.time())
+        self.seq = 0
+        self.msg_item_id = "msg_0"
+        self.text_open = False
+        self.text_index = 0
+        self.text_done = False
+        self.tools: Dict[int, Dict[str, Any]] = {}
+        self.tool_order: List[int] = []
+        self.finish_reason: Optional[str] = None
+        self.usage: Optional[Dict[str, Any]] = None
+        self.emitted_text: List[str] = []
+
+    def start_events(self) -> List[str]:
+        """response.created + response.in_progress, emitted up front."""
+        response = self._skeleton("in_progress", output=[])
+        return [
+            self._event({"type": "response.created", "response": response}),
+            self._event({"type": "response.in_progress", "response": response}),
+        ]
+
+    def _skeleton(
+        self, status: str, output: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        return {
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created,
+            "status": status,
+            "error": None,
+            "incomplete_details": None,
+            "model": self.alias,
+            "output": output,
+            "output_text": "".join(self.emitted_text),
+            "usage": self.usage,
+        }
+
+    def _event(self, payload: Dict[str, Any]) -> str:
+        payload.setdefault("sequence_number", self.seq)
+        self.seq += 1
+        return sse_event_frame(payload)
+
+    def _open_text(self) -> List[str]:
+        if self.text_open:
+            return []
+        self.text_open = True
+        return [
+            self._event(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": self.text_index,
+                    "item": {
+                        "id": self.msg_item_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "in_progress",
+                        "content": [],
+                    },
+                }
+            ),
+            self._event(
+                {
+                    "type": "response.content_part.added",
+                    "item_id": self.msg_item_id,
+                    "output_index": self.text_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "logprobs": []},
+                }
+            ),
+        ]
+
+    def consume(self, chunk: Dict[str, Any]) -> List[str]:
+        """Translate one chat.completion.chunk dict into Responses events."""
+        out: List[str] = []
+        if chunk.get("id") and chunk["id"] != self.response_id and self.seq <= 2:
+            # Keep the client-visible id aligned with the upstream stream.
+            self.response_id = chunk["id"]
+        if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
+            self.usage = _chat_usage_to_responses(chunk["usage"])
+        choices = chunk.get("choices") or []
+        if not choices:
+            return out
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        if isinstance(delta.get("content"), str) and delta["content"]:
+            out += self._open_text()
+            self.emitted_text.append(delta["content"])
+            out.append(
+                self._event(
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": self.msg_item_id,
+                        "output_index": self.text_index,
+                        "content_index": 0,
+                        "delta": delta["content"],
+                    }
+                )
+            )
+        for call in delta.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            index = call.get("index")
+            if index is None:
+                index = len(self.tool_order)
+            if index not in self.tools:
+                self.tools[index] = {
+                    "item_id": f"fc_{index}",
+                    "call_id": call.get("id") or f"call_{index}",
+                    "name": (call.get("function") or {}).get("name", ""),
+                    "output_index": self.text_index + 1 + len(self.tool_order),
+                }
+                self.tool_order.append(index)
+                out.append(
+                    self._event(
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": self.tools[index]["output_index"],
+                            "item": {
+                                "id": self.tools[index]["item_id"],
+                                "type": "function_call",
+                                "call_id": self.tools[index]["call_id"],
+                                "name": self.tools[index]["name"],
+                                "arguments": "",
+                                "status": "in_progress",
+                            },
+                        }
+                    )
+                )
+            args = (call.get("function") or {}).get("arguments")
+            if isinstance(args, str) and args:
+                info = self.tools[index]
+                info["arguments"] = info.get("arguments", "") + args
+                out.append(
+                    self._event(
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": info["item_id"],
+                            "output_index": info["output_index"],
+                            "call_id": info["call_id"],
+                            "delta": args,
+                        }
+                    )
+                )
+        if choice.get("finish_reason"):
+            self.finish_reason = choice["finish_reason"]
+        return out
+
+    def finish(self) -> List[str]:
+        """Close open items and emit the terminal response.completed."""
+        out: List[str] = []
+        output: List[Dict[str, Any]] = []
+        if self.text_open and not self.text_done:
+            text = "".join(self.emitted_text)
+            out.append(
+                self._event(
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": self.msg_item_id,
+                        "output_index": self.text_index,
+                        "content_index": 0,
+                        "text": text,
+                    }
+                )
+            )
+            out.append(
+                self._event(
+                    {
+                        "type": "response.content_part.done",
+                        "item_id": self.msg_item_id,
+                        "output_index": self.text_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": text, "logprobs": []},
+                    }
+                )
+            )
+            out.append(
+                self._event(
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": self.text_index,
+                        "item": {
+                            "id": self.msg_item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [
+                                {"type": "output_text", "text": text, "logprobs": []}
+                            ],
+                        },
+                    }
+                )
+            )
+            self.text_done = True
+            output.append(
+                {
+                    "id": self.msg_item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text, "logprobs": []}],
+                }
+            )
+        for index in self.tool_order:
+            info = self.tools[index]
+            args = info.get("arguments", "")
+            item = {
+                "id": info["item_id"],
+                "type": "function_call",
+                "call_id": info["call_id"],
+                "name": info["name"],
+                "arguments": args,
+                "status": "completed",
+            }
+            out.append(
+                self._event(
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "item_id": info["item_id"],
+                        "output_index": info["output_index"],
+                        "call_id": info["call_id"],
+                        "arguments": args,
+                    }
+                )
+            )
+            out.append(
+                self._event(
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": info["output_index"],
+                        "item": item,
+                    }
+                )
+            )
+            output.append(item)
+        status = "incomplete" if self.finish_reason == "length" else "completed"
+        response = self._skeleton(status, output)
+        if status == "incomplete":
+            response["incomplete_details"] = {"reason": "max_output_tokens"}
+        out.append(self._event({"type": "response.completed", "response": response}))
+        return out
+
+
+
+
+
+# --------------------------------------------------------------------------- #
 # Serialization helpers
 # --------------------------------------------------------------------------- #
 
@@ -1158,6 +1776,8 @@ def _track_usage(alias: str, usage_data: Any, stream: bool) -> None:
     """Best-effort usage/cost recording; never breaks the request path."""
     try:
         entry = MODEL_REGISTRY.get(alias, {})
+        if entry.get("track_usage", True) is False:
+            return
         usage_mod.record(
             alias,
             entry.get("upstream", alias),
@@ -1176,30 +1796,92 @@ def _track_usage(alias: str, usage_data: Any, stream: bool) -> None:
 
 FALLBACK_API_KEY = PORTKEY_API_KEY  # optional; per-request keys take precedence
 
-_CLIENT_CACHE: Dict[str, Portkey] = {}
+_CLIENT_CACHE: Dict[Tuple[str, str], Any] = {}
 _CLIENT_CACHE_LOCK = threading.Lock()
 MAX_CACHED_CLIENTS = 16
 
 
+def _cache_client(cache_key: Tuple[str, str], client: Any) -> Any:
+    """Store a freshly built client, evicting the oldest past the cap.
+
+    Caller must hold _CLIENT_CACHE_LOCK.
+    """
+    _CLIENT_CACHE[cache_key] = client
+    while len(_CLIENT_CACHE) > MAX_CACHED_CLIENTS:
+        oldest = next(iter(_CLIENT_CACHE))
+        evicted = _CLIENT_CACHE.pop(oldest)
+        try:
+            evicted.close()
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+    return client
+
+
 def get_portkey_client(api_key: str) -> Portkey:
     """Return a cached Portkey SDK client bound to the given API key."""
+    cache_key = (api_key, PORTKEY_BASE_URL)
     with _CLIENT_CACHE_LOCK:
-        client = _CLIENT_CACHE.get(api_key)
+        client = _CLIENT_CACHE.get(cache_key)
         if client is None:
-            client = Portkey(
-                api_key=api_key,
-                base_url=PORTKEY_BASE_URL,
-                request_timeout=PORTKEY_TIMEOUT_MS,
+            client = _cache_client(
+                cache_key,
+                Portkey(
+                    api_key=api_key,
+                    base_url=PORTKEY_BASE_URL,
+                    request_timeout=PORTKEY_TIMEOUT_MS,
+                ),
             )
-            _CLIENT_CACHE[api_key] = client
-            while len(_CLIENT_CACHE) > MAX_CACHED_CLIENTS:
-                oldest = next(iter(_CLIENT_CACHE))
-                evicted = _CLIENT_CACHE.pop(oldest)
-                try:
-                    evicted.close()
-                except Exception:  # noqa: BLE001
-                    pass
         return client
+
+
+def get_nrp_client() -> OpenAI:
+    """Return a cached plain OpenAI client for the NRP gateway.
+
+    NRP is a vanilla OpenAI-compatible endpoint that authenticates with
+    `Authorization: Bearer <NRP_API_KEY>`. The Portkey SDK masks that header
+    and sends the key as `x-portkey-api-key` instead, which the NRP gateway
+    rejects with 403, so NRP requests bypass the SDK. The OpenAI client
+    exposes the same `chat.completions` / `responses` surface, so the rest
+    of the proxy is unchanged.
+    """
+    cache_key = (NRP_API_KEY, NRP_BASE_URL)
+    with _CLIENT_CACHE_LOCK:
+        client = _CLIENT_CACHE.get(cache_key)
+        if client is None:
+            client = _cache_client(
+                cache_key, OpenAI(api_key=NRP_API_KEY, base_url=NRP_BASE_URL)
+            )
+        return client
+
+
+_NRP_CHAT_PARAMS = frozenset(
+    p
+    for p in inspect.signature(_VendoredChatCompletions.create).parameters
+    if p != "self"
+)
+
+
+def _nrp_chat_kwargs(
+    client: Any, kwargs: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Fold parameters the vendored OpenAI client doesn't accept into extra_body.
+
+    The Portkey SDK forwards unknown chat parameters into the request body by
+    itself, but the plain OpenAI client used for NRP raises TypeError on them
+    (e.g. a stray `mock_upstream_mode` from the test suite, or any future
+    chat parameter). Only the NRP client needs this; Portkey requests pass
+    through untouched.
+    """
+    if not isinstance(client, OpenAI):
+        return kwargs
+    unknown = {k: v for k, v in kwargs.items() if k not in _NRP_CHAT_PARAMS}
+    if not unknown:
+        return kwargs
+    kept = {k: v for k, v in kwargs.items() if k in _NRP_CHAT_PARAMS}
+    body = dict(kept.get("extra_body") or {})
+    body.update(unknown)
+    kept["extra_body"] = body
+    return kept
 
 
 def resolve_api_key(request: Request) -> Optional[str]:
@@ -1220,13 +1902,14 @@ def resolve_api_key(request: Request) -> Optional[str]:
 async def lifespan(_: FastAPI):
     logging.info(
         "Portkey proxy v%s ready: upstream=%s models=%s fallback_key=%s "
-        "tools_reasoning=%s responses=%s",
+        "tools_reasoning=%s responses=%s nrp=%s",
         PROXY_VERSION,
         PORTKEY_BASE_URL,
         ", ".join(MODEL_REGISTRY),
         "configured" if FALLBACK_API_KEY else "none (per-request keys only)",
         TOOLS_REASONING_EFFORT,
         "enabled" if RESPONSES_ENABLED else "disabled",
+        f"{NRP_BASE_URL} (key={'set' if NRP_API_KEY else 'unset'})",
     )
     yield
     with _CLIENT_CACHE_LOCK:
@@ -1277,11 +1960,13 @@ async def access_log(request: Request, call_next):
 
 async def _validated_request(
     request: Request,
-) -> Tuple[Portkey, str, str, Dict[str, Any]]:
+) -> Tuple[Any, str, str, Dict[str, Any]]:
     """Parse + authenticate a request body shared by both completions routes.
 
-    Returns (client, alias, upstream, body). Raises ApiError on any problem:
-    bad JSON, missing/unknown model, or no API key.
+    Returns (client, alias, upstream, body) where client is a Portkey SDK
+    client, or a plain OpenAI client for NRP models (same call surface).
+    Raises ApiError on any problem: bad JSON, missing/unknown model, or no
+    API key.
     """
     try:
         body = await request.json()
@@ -1289,19 +1974,6 @@ async def _validated_request(
         raise ApiError(400, "Request body is not valid JSON.")
     if not isinstance(body, dict):
         raise ApiError(400, "Request body must be a JSON object.")
-
-    api_key = resolve_api_key(request)
-    if not api_key:
-        raise ApiError(
-            401,
-            "No API key provided. Enter your Portkey / AI Sandbox API key in the "
-            "Copilot app's model provider settings (it is sent as "
-            "'Authorization: Bearer <key>'), or set PORTKEY_API_KEY in the "
-            "proxy's environment or .env file as a fallback.",
-            err_type="authentication_error",
-            code="missing_api_key",
-        )
-    client = get_portkey_client(api_key)
 
     model = body.get("model")
     if not isinstance(model, str) or not model:
@@ -1318,7 +1990,37 @@ async def _validated_request(
             code="model_not_found",
             param="model",
         )
-    return client, model, MODEL_REGISTRY[model]["upstream"], body
+
+    entry = MODEL_REGISTRY[model]
+    if entry.get("api_source") == "nrp":
+        # NRP models use a fixed key from the environment (not the request key)
+        # and are served by a plain OpenAI client (Bearer auth) against the
+        # NRP gateway; the Portkey SDK's x-portkey-api-key scheme gets 403s.
+        if not NRP_API_KEY:
+            raise ApiError(
+                401,
+                "NRP_API_KEY is not set. Add NRP_API_KEY=... to the proxy's "
+                "environment or .env file to use NRP models.",
+                err_type="authentication_error",
+                code="missing_api_key",
+            )
+        client = get_nrp_client()
+        return client, model, entry["upstream"], body
+
+    api_key = resolve_api_key(request)
+    if not api_key:
+        raise ApiError(
+            401,
+            "No API key provided. Enter your Portkey / AI Sandbox API key in the "
+            "Copilot app's model provider settings (it is sent as "
+            "'Authorization: ******'), or set PORTKEY_API_KEY in the "
+            "proxy's environment or .env file as a fallback.",
+            err_type="authentication_error",
+            code="missing_api_key",
+        )
+
+    client = get_portkey_client(api_key)
+    return client, model, entry["upstream"], body
 
 
 def _sse_stream(
@@ -1448,6 +2150,7 @@ async def chat_completions(request: Request):
     kwargs = {k: v for k, v in body.items() if k not in ("model", "stream")}
     if stream and INCLUDE_STREAM_USAGE:
         kwargs.setdefault("stream_options", {"include_usage": True})
+    kwargs = _nrp_chat_kwargs(client, kwargs)
 
     # Per-model reasoning handling: rewrite effort values the model rejects
     # (gpt-6-astra has no "none"), and build the ordered list of request
@@ -1704,6 +2407,44 @@ def _sse_responses_stream(
         )
 
 
+def _sse_nrp_responses_stream(
+    client: OpenAI,
+    upstream: str,
+    alias: str,
+    kwargs: Dict[str, Any],
+) -> Generator[str, None, None]:
+    """Stream NRP chat completions and re-emit them as Responses SSE events.
+
+    The upstream has no working /v1/responses, so the reply is translated from
+    chat chunks. Like real Responses streams it ends with `response.completed`
+    (carrying usage) and never sends `data: [DONE]`.
+    """
+    translator = _ChatToResponsesSSE(alias, upstream)
+    for frame in translator.start_events():
+        yield frame
+    kwargs = _nrp_chat_kwargs(client, kwargs)
+    try:
+        stream = client.chat.completions.create(
+            model=upstream, stream=True, **kwargs
+        )
+        for chunk in stream:
+            data = to_json_dict(chunk)
+            for frame in translator.consume(data):
+                yield frame
+    except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
+        status, message, err_type, code, param = _exception_details(exc)
+        if status >= 500:
+            logging.exception("NRP bridge stream failed (status=%s)", status)
+        else:
+            logging.warning("NRP bridge stream failed (status=%s): %s", status, message)
+        yield sse_event_frame(
+            {"type": "error", "message": message, "code": code, "param": param}
+        )
+        return
+    for frame in translator.finish():
+        yield frame
+
+
 @app.post("/v1/responses")
 @app.post("/responses")
 async def responses_create(request: Request):
@@ -1717,6 +2458,53 @@ async def responses_create(request: Request):
         )
     client, alias, upstream, body = await _validated_request(request)
     stream = bool(body.get("stream", False))
+
+    if MODEL_REGISTRY[alias].get("responses_via_chat"):
+        # The upstream has no working Responses API (NRP's /v1/responses is a
+        # broken passthrough); serve this request via chat completions and
+        # translate the reply back. The client never learns the difference.
+        kwargs, _names, note = _responses_to_chat_kwargs(body)
+        if stream and INCLUDE_STREAM_USAGE:
+            kwargs.setdefault("stream_options", {"include_usage": True})
+        kwargs = _nrp_chat_kwargs(client, kwargs)
+        logging.info(
+            "responses request bridged via chat: model=%s stream=%s tools=%s%s",
+            alias,
+            stream,
+            bool(kwargs.get("tools")),
+            f" ({note})" if note else "",
+        )
+        if not stream:
+            try:
+                response = await run_in_threadpool(
+                    client.chat.completions.create, model=upstream, **kwargs
+                )
+            except Exception as exc:  # noqa: BLE001
+                status, message, err_type, code, param = _exception_details(exc)
+                logging.warning(
+                    "NRP bridge error (status=%s, model=%s): %s",
+                    status,
+                    alias,
+                    message,
+                )
+                return JSONResponse(
+                    status_code=status,
+                    content=_error_payload(message, err_type, code, param),
+                )
+            data = _chat_to_responses_completion(
+                to_json_dict(response), alias
+            )
+            _track_usage(alias, data.get("usage"), stream=False)
+            return JSONResponse(data)
+        return StreamingResponse(
+            _sse_nrp_responses_stream(client, upstream, alias, kwargs),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     caps = reasoning_caps(alias)
     kwargs, note = _responses_kwargs(body, caps)
@@ -1830,6 +2618,7 @@ def main() -> None:
     print(f" Portkey OpenAI-compatible proxy v{PROXY_VERSION}")
     print(f"   Local endpoint : http://{args.host}:{args.port}/v1")
     print(f"   Portkey gateway: {PORTKEY_BASE_URL}")
+    print(f"   NRP gateway    : {NRP_BASE_URL} (key {'set' if NRP_API_KEY else 'NOT set'})")
     print("   Auth           : API key from each request (set it in the Copilot app)")
     print(f"   Fallback key   : {_masked_key(FALLBACK_API_KEY)}")
     print(f"   Models         : {', '.join(sorted(MODEL_REGISTRY))}")

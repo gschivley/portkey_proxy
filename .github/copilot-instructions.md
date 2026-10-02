@@ -19,7 +19,7 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the full integration test suite (173 checks; boots a mock upstream + the real proxy)
+# Run the full integration test suite (208 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -31,8 +31,9 @@ pip install -r requirements.txt
 ## Architecture
 
 - `proxy.py` — everything: `.env` loading, model registry, reasoning handling,
-  Portkey client cache, FastAPI app (chat completions + Responses API), error
-  translation, `main()`.
+  client cache (Portkey SDK + plain OpenAI client for NRP), FastAPI app (chat
+  completions + Responses API), the Responses→chat bridge for `responses_via_chat`
+  models, error translation, `main()`.
 - `usage.py` — usage & cost tracking (imported by `proxy.py` and `usage_report.py`).
   Reads its config at import time (after `.env` loading). `PricingCache` fetches
   `GET {PRICING_BASE_URL}/pricing/<provider>/<model>` (public Portkey API) with a
@@ -51,7 +52,8 @@ pip install -r requirements.txt
   accepts tools + reasoning, matching the real upstream on that endpoint, and
   rejects chat-only `stream_options` the way the real one does). Test-only
   `mock_tool_call` makes the responses route emit a `function_call` item (with
-  streamed argument deltas) instead of a message. Also serves
+  streamed argument deltas) instead of a message; `mock_chat_tool_call` does the
+  same on the chat route. `_captured.json` also records the request `path`. Also serves
   `GET /pricing/<provider>/<model>` (fixed `openai`/`google` rates; `anthropic`
   404s to exercise the no-pricing path) and honors a `mock_cached_tokens` field to
   report cached input tokens in `usage` and a `mock_cache_write_tokens` field to
@@ -62,7 +64,9 @@ pip install -r requirements.txt
   chat→Responses bridge (tool-call round trip, multi-turn tool history,
   `stream_options` dropping); section 9 boots a dedicated tracking
   proxy with `USAGE_TRACKING=1` pointed at isolated `_usage_test.jsonl` /
-  `_pricing_cache_test.json` files.
+  `_pricing_cache_test.json` files; section 10 boots a proxy with
+  `NRP_API_KEY`/`NRP_BASE_URL` pointed at the mock to cover the NRP Bearer auth
+  and the Responses→chat bridge.
 - `portkey_text_example.py` / `faqs.txt` — reference material from Princeton
   (official SDK example and AI Sandbox FAQ); not part of the proxy.
 
@@ -84,6 +88,25 @@ pip install -r requirements.txt
 
 ## Key conventions
 
+- **NRP is a second api_source, not Portkey**: registry entries with
+  `api_source: "nrp"` (`qwen3`, `deepseek-v4-flash`, `glm-5`) are served by a
+  plain `OpenAI` client (`get_nrp_client`, from `portkey_ai._vendor.openai`)
+  with `Authorization: Bearer $NRP_API_KEY`; the Portkey SDK masks that header
+  and sends `x-portkey-api-key`, which NRP rejects with 403. They are
+  zero-cost: `track_usage: False` keeps them out of `usage.jsonl`. The vendored
+  client's `chat.completions.create` has a keyword whitelist, so
+  `_nrp_chat_kwargs` folds unknown body params into `extra_body` (Portkey
+  does this itself).
+- **Responses→chat bridge (`responses_via_chat: True`)**: NRP's `/v1/responses`
+  is a broken passthrough (400s on Responses bodies), so `responses_create`
+  converts the request via `_responses_to_chat_kwargs` (input items → messages,
+  flat tools → nested, `function_call`/`function_call_output` → tool_calls/tool
+  messages, `max_output_tokens` → `max_completion_tokens`,
+  `reasoning.effort` → `reasoning_effort`, `text.format` → `response_format`),
+  calls the chat endpoint, and converts the reply back via
+  `_chat_to_responses_completion` / `_ChatToResponsesSSE` (typed events,
+  `response.completed` terminator, no `[DONE]`). Log line:
+  `responses request bridged via chat: ...`.
 - **Routes are mounted twice**: every endpoint exists at both `/v1/...` and bare
   `/...` (e.g. `/v1/chat/completions` and `/chat/completions`, `/v1/responses`
   and `/responses`). Keep both when adding endpoints.
@@ -175,4 +198,4 @@ pip install -r requirements.txt
   actually forwarded; it's gitignored and deleted at the end of the run.
 - Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log` (gitignored).
 - After changing proxy behavior, run `./.venv/bin/python test_proxy.py` and
-  confirm "ALL TESTS PASSED" (173 checks).
+  confirm "ALL TESTS PASSED" (208 checks).
