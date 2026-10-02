@@ -50,7 +50,9 @@ Two NRP quirks are handled transparently:
   implement it (its gateway forwards Responses bodies to chat-completions
   validation and 400s). For registry entries with `responses_via_chat: True`,
   the proxy converts the Responses request into chat-completions parameters
-  (`input` items → `messages`, flat tools → nested, `function_call` /
+  (`input` items → `messages`, `input_text`/`output_text` → chat `text` parts
+  for every role (including assistant history), refusal parts preserved,
+  flat tools → nested, `function_call` /
   `function_call_output` → `tool_calls` / tool messages,
   `max_output_tokens` → `max_completion_tokens`, `reasoning.effort` →
   `reasoning_effort`), calls `/v1/chat/completions`, and translates the reply —

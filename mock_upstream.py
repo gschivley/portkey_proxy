@@ -131,6 +131,18 @@ async def chat_completions(request: Request):
     model = body.get("model", "unknown")
     now = int(time.time())
 
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            part.get("type") in ("input_text", "output_text")
+            for part in content
+            if isinstance(part, dict)
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": "Chat content parts must use text, not input_text or output_text."}},
+            )
+
     has_tools = bool(body.get("tools"))
     effort = _effort_of(body)
     if mode == "reject_with_reasoning" and has_tools and effort is not None:

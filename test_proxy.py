@@ -1882,6 +1882,49 @@ def main() -> int:
             json.dumps(out)[:300],
         )
 
+        # Copilot resends assistant Responses output items as conversation history.
+        for stream_history in (False, True):
+            history = [
+                {"role": "user", "content": [{"type": "input_text", "text": "Hi"}]},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hello", "annotations": []}],
+                },
+                {"role": "assistant", "content": "Earlier reply"},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "refusal", "refusal": "Cannot do that."}],
+                },
+                {"role": "user", "content": "Continue"},
+            ]
+            r = client4.post(
+                "/v1/responses",
+                json={"model": "qwen3", "input": history, "stream": stream_history},
+            )
+            cap = json.loads(CAPTURE.read_text())
+            messages = cap["body"]["messages"]
+            check(
+                f"nrp: history uses chat text/refusal parts (stream={stream_history})",
+                messages[0]["content"] == [{"type": "text", "text": "Hi"}]
+                and messages[1]["content"] == [{"type": "text", "text": "Hello"}]
+                and messages[2]["content"] == [{"type": "text", "text": "Earlier reply"}]
+                and messages[3]["content"] == [{"type": "refusal", "refusal": "Cannot do that."}],
+                str(messages),
+            )
+            result = parse_sse(r.text)[-1] if stream_history else r.json()
+            check(
+                f"nrp: assistant history completes (stream={stream_history})",
+                r.status_code == 200
+                and (
+                    result.get("type") == "response.completed"
+                    if stream_history
+                    else result.get("status") == "completed"
+                ),
+                r.text[-500:],
+            )
+
         # --- responses bridge: streaming text -----------------------------
         r = client4.post(
             "/v1/responses",

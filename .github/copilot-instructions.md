@@ -19,7 +19,7 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the full integration test suite (204 checks; boots a mock upstream + the real proxy)
+# Run the full integration test suite (208 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -198,4 +198,4 @@ pip install -r requirements.txt
   actually forwarded; it's gitignored and deleted at the end of the run.
 - Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log` (gitignored).
 - After changing proxy behavior, run `./.venv/bin/python test_proxy.py` and
-  confirm "ALL TESTS PASSED" (204 checks).
+  confirm "ALL TESTS PASSED" (208 checks).

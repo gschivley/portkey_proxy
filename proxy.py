@@ -1202,7 +1202,7 @@ _NRP_DROPPED_PARAMS = (
 )
 
 
-def _responses_content_to_chat_parts(content: Any, *, is_output: bool) -> List[Dict[str, Any]]:
+def _responses_content_to_chat_parts(content: Any) -> List[Dict[str, Any]]:
     """Map Responses message content parts onto their chat equivalents."""
     if isinstance(content, str):
         return [{"type": "text", "text": content}]
@@ -1213,9 +1213,9 @@ def _responses_content_to_chat_parts(content: Any, *, is_output: bool) -> List[D
         ptype = part.get("type")
         text = part.get("text") or part.get("refusal") or ""
         if ptype in ("input_text", "output_text", "text"):
-            parts.append(
-                {"type": "output_text" if is_output else "text", "text": text}
-            )
+            parts.append({"type": "text", "text": text})
+        elif ptype == "refusal":
+            parts.append({"type": "refusal", "refusal": part.get("refusal") or ""})
         elif ptype in ("input_image", "image_url"):
             image = (
                 part.get("image_url")
@@ -1264,7 +1264,7 @@ def _responses_input_to_messages(
                 {
                     "role": role,
                     "content": _responses_content_to_chat_parts(
-                        item.get("content"), is_output=(role == "assistant")
+                        item.get("content")
                     ),
                 }
             )
