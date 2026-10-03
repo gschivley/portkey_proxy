@@ -36,9 +36,13 @@ Configuration (environment / .env):
     ROUTER_CONFIG_PATH             optional JSON file (pools, capabilities)
     ROUTER_FREE_POOL               comma-separated free aliases
                                    (default qwen3,deepseek-v4-flash,glm-5)
-    ROUTER_PAID_POOL               comma-separated paid aliases
-    ROUTER_HARD_POOL               pool for hard tasks (default: paid pool)
-    ROUTER_REVIEW_POOL             pool for reviews (default: paid pool)
+    ROUTER_PAID_POOL               comma-separated paid aliases (default:
+                                   curated order gpt-6.1-sol, claude-opus-5-5,
+                                   then the rest in registry order; opt-in
+                                   aliases like claude-fable-5-1 are excluded)
+    ROUTER_HARD_POOL               pool for hard tasks (default: the paid
+                                   pool with claude-opus-5-5 promoted first)
+    ROUTER_REVIEW_POOL             pool for reviews (default: like hard)
     ROUTER_MAX_ATTEMPTS            upstream dispatches per request (default 4)
     ROUTER_DEADLINE_SECONDS        stop starting attempts after this (default 120)
     PAID_APPROVAL_THRESHOLD_USD    approval gate (default 230)
@@ -75,6 +79,18 @@ TASKS = ("ordinary", "hard", "review")
 DIFFICULTIES = ("normal", "hard")
 
 DEFAULT_FREE_POOL = ("qwen3", "deepseek-v4-flash", "glm-5")
+
+# Research-informed curated default orders (see README "Free-first model
+# router").
+# Everyday paid escalation starts on GPT-6.1 Sol (OpenAI's cost-conscious
+# complex-work pick); hard/review work starts on Claude Opus 5.5 (Anthropic's
+# recommended default for agentic coding, refactors and code review).
+CURATED_PAID_LEAD = ("gpt-6.1-sol", "claude-opus-5-5")
+CURATED_TASK_LEAD = ("claude-opus-5-5", "gpt-6.1-sol")
+# 2.5x Opus's public rates: keep Fable out of every default pool so routed
+# traffic never lands on it by accident. Add it to a pool (env or JSON
+# config) to opt in; explicit model names always still reach it.
+DEFAULT_OPT_IN_ALIASES = ("claude-fable-5-1",)
 
 # Responses parameters the NRP bridge has no faithful chat equivalent for. A
 # request that carries one of these is not served by an NRP model: the proxy
@@ -373,6 +389,8 @@ def request_requirements(
             reqs["stateful"] = True
         if _native_tool_used(body):
             reqs["native_tools"] = True
+        if _chat_has_image_part(body.get("input")):
+            reqs["image"] = True
         if (body.get("reasoning") or {}).get("effort") if isinstance(body.get("reasoning"), dict) else None:
             reqs["reasoning"] = True
     else:
@@ -504,11 +522,12 @@ class Router:
             return list(value)
 
         paid_pool = pool("paid", self._default_paid_pool())
+        task_default = self._reorder_lead(paid_pool, CURATED_TASK_LEAD)
         self.pools: Dict[str, List[str]] = {
             "free": pool("free", DEFAULT_FREE_POOL),
             "paid": paid_pool,
-            "hard": pool("hard", paid_pool),
-            "review": pool("review", paid_pool),
+            "hard": pool("hard", task_default),
+            "review": pool("review", task_default),
         }
         self.capabilities = self.config.get("capabilities", {})
         if not isinstance(self.capabilities, dict) or any(
@@ -589,12 +608,20 @@ class Router:
         return data
 
     def _default_paid_pool(self) -> List[str]:
-        """Every known non-NRP alias, in registry order (no quality ranking)."""
-        return [
+        """Curated paid order: Sol first (cost-sensitive complex work), Opus next."""
+        known = [
             alias
             for alias, entry in self.registry.items()
             if entry.get("api_source") != "nrp"
+            and alias not in DEFAULT_OPT_IN_ALIASES
         ]
+        return self._reorder_lead(known, CURATED_PAID_LEAD)
+
+    @staticmethod
+    def _reorder_lead(pool: List[str], lead: Tuple[str, ...]) -> List[str]:
+        """Move the curated lead aliases to the front of ``pool``, order preserved."""
+        ordered = [alias for alias in lead if alias in pool]
+        return ordered + [alias for alias in pool if alias not in ordered]
 
     def is_free(self, alias: str) -> bool:
         entry = self.registry.get(alias)
@@ -617,6 +644,9 @@ class Router:
             "stateful_responses": not nrp,
             "tools": True,
         }
+        # Registry-declared modality defaults (e.g. qwen3 has no image input),
+        # then router config on top so either can be overridden by operators.
+        caps.update(entry.get("capabilities") or {})
         caps.update(self.capabilities.get(alias) or {})
         return caps
 

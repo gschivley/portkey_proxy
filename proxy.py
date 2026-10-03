@@ -396,6 +396,9 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "responses_via_chat": True,
         "track_usage": False,
         "provider": "openai",
+        # No vision on this deployment: the router starts image requests on
+        # deepseek-v4-flash instead (still first in the free pool otherwise).
+        "capabilities": {"image": False},
     },
     "deepseek-v4-flash": {
         "upstream": os.environ.get(

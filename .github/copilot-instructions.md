@@ -22,10 +22,10 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the router policy + spend-reader unit suite (170 checks; no server needed)
+# Run the router policy + spend-reader unit suite (177 checks; no server needed)
 ./.venv/bin/python test_routing.py
 
-# Run the integration + controlled-stream suite (342 checks; boots a mock upstream + the real proxy)
+# Run the integration + controlled-stream suite (345 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -86,8 +86,9 @@ pip install -r requirements.txt
   chat→Responses bridge (tool-call round trip, multi-turn tool history,
   `stream_options` dropping); section 9 boots a dedicated tracking
   proxy with `USAGE_TRACKING=1` pointed at isolated `_usage_test.jsonl` /
-  `_pricing_cache_test.json` files; section 11 boots three router proxies (spend
-  $0, spend unknown, spend over cap) pointed at the mock with `ROUTER_ENABLED=1`
+  `_pricing_cache_test.json` files; section 11 boots four router proxies (spend
+  $0, spend unknown, spend over cap, and one without pool overrides to check the
+  curated defaults) pointed at the mock with `ROUTER_ENABLED=1`
   and covers alias advertising, free-first order, hints, capability filtering,
   explicit passthrough, 404-driven fallback in JSON and streaming, mid-stream
   breaks that must not replay, 402 exhaustion reverts, and the approval/cap
@@ -201,6 +202,13 @@ pip install -r requirements.txt
     `REASONING_PROFILES`/`MODEL_REGISTRY`; the tests in `test_proxy.py` cover all
     three behaviors.
 - **Router rules** (`routing.py` owns the policy; `proxy.py` only dispatches):
+  Default pools are curated, not alphabetical: paid starts
+  `gpt-6.1-sol, claude-opus-5-5` (rest in registry order), hard/review promote
+  `claude-opus-5-5` first, and `DEFAULT_OPT_IN_ALIASES` (`claude-fable-5-1`)
+  stay out of every default pool but work when named explicitly. Modality
+  capabilities may be declared on registry entries (`capabilities`, e.g.
+  `qwen3: {image: false}` → vision requests fall through to
+  `deepseek-v4-flash`); router-config `capabilities` override them.
   `allow_paid: false` is a hard veto that outranks the alias (`auto-hard` with
   the veto is served by the free pool), while an explicitly named paid model
   with the veto is a 400. Capability filtering may only *exclude* a candidate —
@@ -269,5 +277,5 @@ pip install -r requirements.txt
   `max_retries=0`, so 408/429/5xx are retried inside one attempt. Router
   fallback tests must use **404** to force an immediate failure.
 - After changing proxy behavior, run `./.venv/bin/python test_routing.py`
-  ("ROUTING TESTS PASSED", 170 checks) and `./.venv/bin/python test_proxy.py`
-  ("ALL TESTS PASSED", 342 checks).
+  ("ROUTING TESTS PASSED", 177 checks) and `./.venv/bin/python test_proxy.py`
+  ("ALL TESTS PASSED", 345 checks).

@@ -2132,22 +2132,27 @@ def main() -> int:
         #   proxy7  tracking on, spend over cap  -> free models only
         attempts_file = ROOT / "_captured_attempts.jsonl"
 
-        def boot_router(suffix: str, **overrides):
+        def boot_router(suffix: str, pools: bool = True, **overrides):
             env_r = dict(env)
             env_r.update(
                 {
                     "ROUTER_ENABLED": "1",
                     "NRP_API_KEY": "nrp-test-key",
                     "NRP_BASE_URL": f"http://127.0.0.1:{mock_port}/v1",
-                    "ROUTER_PAID_POOL": "gpt-6-luna,gpt-5.6-sol",
-                    "ROUTER_HARD_POOL": "gpt-6-luna,gpt-5.6-sol",
-                    "ROUTER_REVIEW_POOL": "gpt-6-luna,gpt-5.6-sol",
                     "USAGE_TRACKING": "1",
                     "USAGE_LOG_PATH": str(ROOT / f"_router_{suffix}.jsonl"),
                     "PRICING_CACHE_PATH": str(ROOT / f"_pricing_cache_router_{suffix}.json"),
                     "PRICING_BASE_URL": f"http://127.0.0.1:{mock_port}",
                 }
             )
+            if pools:
+                env_r.update(
+                    {
+                        "ROUTER_PAID_POOL": "gpt-6-luna,gpt-5.6-sol",
+                        "ROUTER_HARD_POOL": "gpt-6-luna,gpt-5.6-sol",
+                        "ROUTER_REVIEW_POOL": "gpt-6-luna,gpt-5.6-sol",
+                    }
+                )
             env_r.update(overrides)
             (ROOT / f"_router_{suffix}.jsonl").unlink(missing_ok=True)
             (ROOT / f"_pricing_cache_router_{suffix}.json").unlink(missing_ok=True)
@@ -2209,6 +2214,51 @@ def main() -> int:
             and st["spend"]["budget_exhausted"] is False,
             json.dumps(st)[:250],
         )
+
+        # --- curated default pools (no pool env overrides) ------------------
+        rc8 = boot_router("8", pools=False)
+        st8 = rc8.get("/v1/router").json()
+        check(
+            "router defaults: paid Sol-first, hard/review Opus-first, Fable opt-out",
+            st8["pools"]["paid"][:2] == ["gpt-6.1-sol", "claude-opus-5-5"]
+            and st8["pools"]["hard"][0] == "claude-opus-5-5"
+            and st8["pools"]["hard"][1] == "gpt-6.1-sol"
+            and st8["pools"]["review"] == st8["pools"]["hard"]
+            and "claude-fable-5-1" not in st8["pools"]["paid"] + st8["pools"]["hard"],
+            json.dumps(st8["pools"])[:250],
+        )
+        reset_attempts()
+        r = rc8.post(
+            "/v1/chat/completions",
+            json={"model": "auto-hard", "messages": [{"role": "user", "content": "review this diff"}]},
+        )
+        check(
+            "router defaults: auto-hard serves claude-opus-5-5 first",
+            r.status_code == 200 and r.headers.get("x-proxy-model") == "claude-opus-5-5",
+            f"{r.status_code} {r.headers.get('x-proxy-model')}",
+        )
+        reset_attempts()
+        r = rc8.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto-free",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what is in this screenshot?"},
+                            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                        ],
+                    }
+                ],
+            },
+        )
+        check(
+            "router defaults: vision request skips qwen3, serves deepseek-v4-flash",
+            r.status_code == 200 and r.headers.get("x-proxy-model") == "deepseek-v4-flash",
+            f"{r.status_code} {r.headers.get('x-proxy-model')}",
+        )
+        reset_attempts()
 
         # --- free-first selection ------------------------------------------
         reset_attempts()

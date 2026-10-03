@@ -44,6 +44,7 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
         "api_source": "nrp",
         "responses_via_chat": True,
         "track_usage": False,
+        "capabilities": {"image": False},
     },
     "deepseek-v4-flash": {
         "upstream": "deepseek-v4-flash",
@@ -62,7 +63,11 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
 }
 
 FREE = ["qwen3", "deepseek-v4-flash", "glm-5"]
-PAID = ["gpt-5.6-sol", "gpt-6-luna", "gpt-6.1-sol", "claude-opus-5-5", "gemini-3.8-flash"]
+# Curated default paid-pool order: Sol first, Opus second, rest in registry
+# order (mirrors routing.CURATED_PAID_LEAD).
+PAID = ["gpt-6.1-sol", "claude-opus-5-5", "gpt-5.6-sol", "gpt-6-luna", "gemini-3.8-flash"]
+# Curated default hard/review order: Opus first (mirrors CURATED_TASK_LEAD).
+PAID_TASK = ["claude-opus-5-5", "gpt-6.1-sol", "gpt-5.6-sol", "gpt-6-luna", "gemini-3.8-flash"]
 
 
 def make_router(
@@ -251,11 +256,11 @@ def main() -> int:
     p = plan(r, "auto-free", hints={"allow_paid": False})
     check("allow_paid=false: free only", p.candidates == FREE and p.gate == "free-only", str(p.candidates))
     p = plan(r, "auto-hard")
-    check("auto-hard: paid pool only", p.candidates == PAID and p.gate == "hard", str(p.candidates))
+    check("auto-hard: paid pool only", p.candidates == PAID_TASK and p.gate == "hard", str(p.candidates))
     p = plan(r, "auto-review")
-    check("auto-review: review pool", p.candidates == PAID and p.gate == "review", str(p.candidates))
+    check("auto-review: review pool", p.candidates == PAID_TASK and p.gate == "review", str(p.candidates))
     p = plan(r, "auto-free", hints={"task": "hard"})
-    check("task hint overrides alias", p.gate == "hard" and p.candidates == PAID, str(p.gate))
+    check("task hint overrides alias", p.gate == "hard" and p.candidates == PAID_TASK, str(p.gate))
     p = plan(r, "auto-free", hints={"difficulty": "hard"})
     check("difficulty hint escalates", p.gate == "hard", str(p.gate))
     p = plan(r, "auto-hard", hints={"task": "ordinary"})
@@ -500,6 +505,73 @@ def main() -> int:
         "config: declared capability excludes a model",
         "glm-5" not in p.candidates and ("glm-5", "no-tools") in p.skipped,
         str(p.skipped),
+    )
+
+    # --- 13b. curated defaults, opt-in exclusion, vision routing ------------ #
+    r = make_router(0.0, max_attempts=8)
+    check(
+        "defaults: curated paid Sol-first, hard/review Opus-first",
+        r.pools["paid"] == PAID and r.pools["hard"] == PAID_TASK and r.pools["review"] == PAID_TASK,
+        str(r.pools),
+    )
+    fable_entry = {"upstream": "claude-fable-5-1", "provider": "anthropic"}
+    freg = dict(REGISTRY)
+    freg["claude-fable-5-1"] = fable_entry
+    rf = routing.Router(
+        freg, spend_func=lambda: 0.0, month_func=lambda: "2026-09", max_attempts=8
+    )
+    check(
+        "defaults: opt-in Fable stays out of every default pool",
+        "claude-fable-5-1" not in rf.pools["paid"] + rf.pools["hard"] + rf.pools["review"],
+        str(rf.pools),
+    )
+    p = plan(rf, "auto-hard")
+    check(
+        "opt-in: Fable absent from routed ladder",
+        "claude-fable-5-1" not in p.candidates,
+        str(p.candidates),
+    )
+    p = plan(rf, "claude-fable-5-1")
+    check(
+        "opt-in: explicit Fable name still works",
+        p.candidates == ["claude-fable-5-1"] and p.gate == "explicit",
+        str(p.candidates),
+    )
+    img_body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is in this image?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                ],
+            }
+        ]
+    }
+    p = plan(make_router(0.0, max_attempts=8), "auto-free", body=img_body)
+    check(
+        "vision: chat image request skips qwen3, starts on deepseek",
+        p.candidates == ["deepseek-v4-flash", "glm-5"] + PAID
+        and ("qwen3", "no-image") in p.skipped,
+        str(p.skipped),
+    )
+    p = plan(
+        make_router(0.0, max_attempts=8),
+        "auto-free",
+        wire="responses",
+        body={"input": [{"role": "user", "content": [{"type": "input_image", "image_url": "u"}]}]},
+    )
+    check(
+        "vision: responses wire detects input_image",
+        p.candidates == ["deepseek-v4-flash", "glm-5"] + PAID,
+        str(p.candidates),
+    )
+    r = make_router(0.0, config={"capabilities": {"qwen3": {"image": True}}})
+    p = plan(r, "auto-free", body=img_body, have_nrp_key=True)
+    check(
+        "vision: config can re-admit qwen3 for images",
+        p.candidates[0] == "qwen3",
+        str(p.candidates),
     )
     with tempfile.TemporaryDirectory() as tmp:
         cfg = Path(tmp) / "router.json"

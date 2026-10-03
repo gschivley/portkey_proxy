@@ -229,11 +229,20 @@ and with the router off (the default) nothing changes at all.
 | Alias | Pool used (in order) | For |
 | ------- | ---------------------- | ----- |
 | `auto-free` | free pool, then paid | everyday requests |
-| `auto-hard` | paid pool | difficult tasks |
-| `auto-review` | review pool (default: paid) | code review / final checks |
+| `auto-hard` | hard pool (default: paid pool, Opus first) | difficult tasks |
+| `auto-review` | review pool (default: same as hard) | code review / final checks |
 
-- **free pool** — `qwen3`, `deepseek-v4-flash`, `glm-5` (zero cost)
-- **paid pool** — every Portkey model in `MODEL_REGISTRY`, registry order
+- **free pool** — `qwen3`, `deepseek-v4-flash`, `glm-5` (zero cost). `qwen3` is
+  the default pick; it declares no image input, so vision requests start on
+  `deepseek-v4-flash` instead (and any free model that errors over falls back
+  to the next one).
+- **paid pool** — curated default: `gpt-6.1-sol` first (cost-conscious complex
+  work), then `claude-opus-5-5`, then the remaining Portkey models in
+  `MODEL_REGISTRY` order. `claude-fable-5-1` is **opt-in only**: it sits out of
+  every default pool (2.5x Opus's rates) but still works when named explicitly
+  or added to a pool via config.
+- **hard / review pools** — the paid pool with `claude-opus-5-5` promoted to
+  the front (Anthropic's recommended default for agentic coding and review).
 
 Pools are reconfigured with `ROUTER_FREE_POOL` / `ROUTER_PAID_POOL` /
 `ROUTER_HARD_POOL` / `ROUTER_REVIEW_POOL` (comma-separated aliases) or a
@@ -272,8 +281,9 @@ A candidate is skipped when it cannot honour the request as sent — the proxy
 never silently drops content or parameters to make a model fit:
 
 - function tools on a model that has none
-- image/audio input on a model declared without it (declare extras in the
-  config file's `capabilities`)
+- image/audio input on a model declared without it (the registry declares
+  `qwen3: {image: false}`; add or change extras in the config file's
+  `capabilities`, which overrides the registry)
 - Responses-only parameters (`previous_response_id`, `store`, `background`,
   `include`, `prompt`, `truncation`, `service_tier`, …), native tool types
   (`web_search`, `mcp`, `shell`, …), item references, files, unknown input/content
@@ -448,8 +458,8 @@ freely (a month's totals are always recomputed from the records present).
 Two suites, both against a mock upstream (no real key needed):
 
 ```bash
-./.venv/bin/python test_routing.py   # 170 checks: router policy and spend reader
-./.venv/bin/python test_proxy.py     # 342 checks: end-to-end + controlled stream regressions
+./.venv/bin/python test_routing.py   # 177 checks: router policy and spend reader
+./.venv/bin/python test_proxy.py     # 345 checks: end-to-end + controlled stream regressions
 ```
 
 `test_routing.py` exercises `routing.py` directly (pools, hints, capability
