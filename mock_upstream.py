@@ -20,22 +20,47 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 CAPTURE = Path(__file__).resolve().parent / "_captured.json"
+# Append-only mirror of every request. The router tries several models per
+# client request, so the last-write-wins CAPTURE file cannot show them all.
+ATTEMPTS = Path(__file__).resolve().parent / "_captured_attempts.jsonl"
 
 app = FastAPI()
 
+# Keys of requests already failed by `mock_fail_once_key`.
+_SEEN_FAIL_KEYS: set = set()
+
 
 def _record(request: Request, body: Dict[str, Any]) -> None:
-    CAPTURE.write_text(
-        json.dumps(
-            {
-                "path": request.url.path,
-                "headers": {k: v for k, v in request.headers.items()},
-                "body": body,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    record = {
+        "path": request.url.path,
+        "headers": {k: v for k, v in request.headers.items()},
+        "body": body,
+    }
+    CAPTURE.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    with ATTEMPTS.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+def _model_scoped_failure(body: Dict[str, Any], model: str):
+    """Test-only: fail only for selected upstream models.
+
+    Lets a test give one router candidate a transient or quota error while a
+    later candidate still answers, which is how the fallback ladder is checked.
+    """
+    targets = body.get("mock_fail_models")
+    if not targets or model not in targets:
+        return None
+    key = body.get("mock_fail_once_key")
+    if key:
+        if key in _SEEN_FAIL_KEYS:
+            return None
+        _SEEN_FAIL_KEYS.add(key)
+    status = int(body.get("mock_fail_status", 500))
+    message = body.get("mock_fail_message") or f"Simulated upstream failure for {model}."
+    code = body.get("mock_fail_code")
+    if status == 429:
+        return _error(429, message, code=code or "rate_limit_exceeded")
+    return _error(status, message, code=code)
 
 
 def _sse(payload: Dict[str, Any]) -> str:
@@ -127,6 +152,15 @@ async def chat_completions(request: Request):
     cache_write_tokens = body.pop("mock_cache_write_tokens", None)
     # Test-only directive: reply with a tool call instead of a text message.
     chat_tool_call = body.pop("mock_chat_tool_call", None)
+    # Test-only directive: die mid-stream after the first chunk (the router must
+    # surface this as a broken response, never replay it on another model).
+    stream_break = body.pop("mock_stream_break", None)
+    # Test-only directives: per-model failures for the router fallback ladder.
+    fail_models = body.pop("mock_fail_models", None)
+    fail_once_key = body.pop("mock_fail_once_key", None)
+    fail_status = body.pop("mock_fail_status", None)
+    fail_code = body.pop("mock_fail_code", None)
+    fail_message = body.pop("mock_fail_message", None)
     _record(request, body)
     model = body.get("model", "unknown")
     now = int(time.time())
@@ -155,6 +189,18 @@ async def chat_completions(request: Request):
         # gpt-6-astra-style upstream: tools + reasoning is fine, but 'none'
         # is not a supported reasoning_effort value.
         return _unsupported_effort_error("none")
+    failure = _model_scoped_failure(
+        {
+            "mock_fail_models": fail_models,
+            "mock_fail_once_key": fail_once_key,
+            "mock_fail_status": fail_status,
+            "mock_fail_code": fail_code,
+            "mock_fail_message": fail_message,
+        },
+        model,
+    )
+    if failure is not None:
+        return failure
 
     # Configurable failure modes used by the integration test.
     if body.get("fail") == "auth":
@@ -241,6 +287,10 @@ async def chat_completions(request: Request):
                 ],
             }
         )
+        if stream_break:
+            # One frame is already on the wire: raise so the connection is cut
+            # without a terminating chunk.
+            raise RuntimeError("mock stream break")
         if chat_tool_call:
             yield _sse(
                 {
@@ -375,6 +425,12 @@ async def responses(request: Request):
     # Test-only directive: answer with a function_call output item instead of a
     # message, so the chat<->responses bridge can be exercised end to end.
     tool_call = body.pop("mock_tool_call", None)
+    # Test-only directives: per-model failures for the router fallback ladder.
+    fail_models = body.pop("mock_fail_models", None)
+    fail_once_key = body.pop("mock_fail_once_key", None)
+    fail_status = body.pop("mock_fail_status", None)
+    fail_code = body.pop("mock_fail_code", None)
+    fail_message = body.pop("mock_fail_message", None)
     _record(request, body)
     model = body.get("model", "unknown")
     now = int(time.time())
@@ -383,6 +439,18 @@ async def responses(request: Request):
     # tools+reasoning conflict on this endpoint.
     if mode == "reject_none_effort" and _effort_of(body) == "none":
         return _unsupported_effort_error("none")
+    failure = _model_scoped_failure(
+        {
+            "mock_fail_models": fail_models,
+            "mock_fail_once_key": fail_once_key,
+            "mock_fail_status": fail_status,
+            "mock_fail_code": fail_code,
+            "mock_fail_message": fail_message,
+        },
+        model,
+    )
+    if failure is not None:
+        return failure
 
     # The real upstream rejects chat-completions-only parameters on this
     # endpoint (verified 2026-09-29): "Unknown parameter:

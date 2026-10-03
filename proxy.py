@@ -89,6 +89,27 @@ Configuration (local .env file next to this script, or environment):
                            (default gpt-6-sol — the catalog has no entry under
                            the deployment name)
 
+Free-first routing (see routing.py; opt-in, GET /v1/router):
+    ROUTER_ENABLED           "1" to accept the virtual model aliases
+                             auto-free / auto-hard / auto-review and to apply
+                             the paid-approval + budget gates to explicit paid
+                             models too (default off: only named models work)
+    ROUTER_CONFIG_PATH       optional JSON file with pools / capabilities /
+                             native_only_params / max_attempts / thresholds
+    ROUTER_FREE_POOL         free (NRP) aliases, in order
+                             (default qwen3,deepseek-v4-flash,glm-5)
+    ROUTER_PAID_POOL         paid (Portkey) aliases, in order
+    ROUTER_HARD_POOL         pool for hard tasks (default: paid pool)
+    ROUTER_REVIEW_POOL       pool for review tasks (default: paid pool)
+    ROUTER_MAX_ATTEMPTS      upstream dispatches per request (default 4)
+    ROUTER_DEADLINE_SECONDS  stop starting new attempts after this long
+                             (default 120)
+    PAID_APPROVAL_THRESHOLD_USD
+                             recorded monthly spend at/above which every paid
+                             request needs proxy_routing.paid_approved (230);
+                             must be below MONTHLY_BUDGET_USD, at which point
+                             routing becomes free-only
+
 Usage & cost tracking (see usage.py; GET /v1/usage, or run usage_report.py):
     USAGE_TRACKING       "0" to disable recording usage/cost (default on)
     USAGE_LOG_PATH       JSONL usage log path (default usage.jsonl next to
@@ -117,10 +138,10 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, NamedTuple, Optional, Tuple
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from portkey_ai import Portkey
@@ -164,6 +185,10 @@ _load_env_files(SCRIPT_DIR)
 
 # Imported after .env loading: usage.py reads its config at import time.
 import usage as usage_mod  # noqa: E402
+
+# Also imported after .env loading: routing.py reads ROUTER_* config lazily and
+# needs usage.py's MONTHLY_BUDGET_USD for the budget gate.
+import routing as routing_mod  # noqa: E402
 
 PORTKEY_API_KEY = os.environ.get("PORTKEY_API_KEY") or os.environ.get("AI_SANDBOX_KEY")
 _raw_base_url = os.environ.get("PORTKEY_BASE_URL") or "https://api.portkey.ai/v1"
@@ -371,6 +396,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "responses_via_chat": True,
         "track_usage": False,
         "provider": "openai",
+        # Vision verified live 2026-10-02 (Qwen3.8-Flash-Next-FP8 is a
+        # multimodal "Causal Language Model with Vision Encoder"; the NRP
+        # catalog lists image + video input), so no `capabilities` entry is
+        # needed and image requests stay on qwen3 by default.
     },
     "deepseek-v4-flash": {
         "upstream": os.environ.get(
@@ -570,6 +599,8 @@ def _exception_details(
 ) -> Tuple[int, str, str, Optional[str], Optional[str]]:
     """Map SDK/HTTP exceptions onto (status, message, type, code, param)."""
     name = type(exc).__name__
+    if name == "_AttemptFailure":
+        return exc.status_code, str(exc), exc.err_type, exc.code, exc.param
     status_map = {
         "AuthenticationError": (401, "authentication_error"),
         "PermissionDeniedError": (403, "permission_error"),
@@ -1960,18 +1991,210 @@ async def access_log(request: Request, call_next):
     return response
 
 
-# ----------------------------- chat completions ---------------------------- #
+# --------------------------- free-first routing ---------------------------- #
 
 
-async def _validated_request(
-    request: Request,
-) -> Tuple[Any, str, str, Dict[str, Any]]:
-    """Parse + authenticate a request body shared by both completions routes.
+def _build_router() -> Optional[routing_mod.Router]:
+    """Instantiate the router from env/config, or None when disabled.
 
-    Returns (client, alias, upstream, body) where client is a Portkey SDK
-    client, or a plain OpenAI client for NRP models (same call surface).
-    Raises ApiError on any problem: bad JSON, missing/unknown model, or no
-    API key.
+    A misconfigured router aborts startup: silently ignoring a broken
+    ROUTER_CONFIG_PATH would route traffic against rules nobody reviewed.
+    """
+    if not routing_mod.is_enabled():
+        return None
+    try:
+        router = routing_mod.Router(
+            MODEL_REGISTRY,
+            config_path=routing_mod.config_path(),
+            responses_enabled=RESPONSES_ENABLED,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"ROUTER_ENABLED=1 but the router is misconfigured: {exc}")
+    logging.info(
+        "free-first router enabled: free=%s approval_at=$%s budget=$%s tracking=%s",
+        ",".join(router.pools["free"]) or "none",
+        f"{router.approval_threshold_usd:g}",
+        f"{router.monthly_budget_usd:g}",
+        "on" if usage_mod.USAGE_TRACKING else "OFF",
+    )
+    return router
+
+
+ROUTER: Optional[routing_mod.Router] = _build_router()
+
+
+class _AttemptFailure(Exception):
+    """One candidate model's failure, raised while the response is rewindable.
+
+    Only raised when the caller asked for `surface_errors`, so the router can
+    try another model. Once bytes have reached the client the legacy SSE error
+    frames are used and nothing is retried.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        err_type: str = "api_error",
+        code: Optional[str] = None,
+        param: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
+        self.err_type = err_type
+        self.code = code
+        self.param = param
+
+    @classmethod
+    def from_exception(cls, exc: BaseException) -> "_AttemptFailure":
+        status, message, err_type, code, param = _exception_details(exc)
+        return cls(status, message, err_type, code, param)
+
+    @classmethod
+    def from_api_error(cls, exc: ApiError) -> "_AttemptFailure":
+        return cls(exc.status_code, exc.message, exc.err_type, exc.code, exc.param)
+
+    @property
+    def retryable(self) -> bool:
+        """Whether a different candidate could serve this request.
+
+        Transient upstream failures and request-shape rejections qualify. Auth
+        errors do not (they belong to the credential, not the model), and
+        quota exhaustion is handled by the budget gate rather than by retrying.
+        """
+        status, message = self.status_code, str(self)
+        if routing_mod.is_quota_exhaustion(status, message, self.code):
+            return True
+        if status in (404, 408, 425, 429) or status >= 500:
+            return True
+        if _is_tools_reasoning_conflict(status, message):
+            return True
+        return status == 400 and bool(_CAPABILITY_ERROR_RE.search(message))
+
+    @property
+    def policy(self) -> bool:
+        """True when the paid tier itself is unavailable, not the request.
+
+        These failures are what justify reverting a hard/review route to the
+        free pool: another paid model would hit the same wall.
+        """
+        return (
+            self.status_code == 402
+            or self.code in ("budget_exhausted", "insufficient_quota")
+            or routing_mod.is_quota_exhaustion(
+                self.status_code, str(self), self.code
+            )
+        )
+
+    def as_json(self) -> JSONResponse:
+        return JSONResponse(
+            status_code=self.status_code,
+            content=_error_payload(str(self), self.err_type, self.code, self.param),
+        )
+
+    def as_sse(self, wire: str = "chat") -> StreamingResponse:
+        """Serialize a terminal failure in the caller's wire protocol."""
+        payload = _error_payload(str(self), self.err_type, self.code, self.param)["error"]
+        frames = (
+            [sse_event_frame({"type": "error", "message": str(self), "code": self.code, "param": self.param})]
+            if wire == "responses"
+            else [sse_frame({"error": payload}), "data: [DONE]\n\n"]
+        )
+        return StreamingResponse(
+            iter(frames),
+            media_type="text/event-stream",
+            headers=sse_headers(),
+        )
+
+
+_CAPABILITY_ERROR_RE = re.compile(
+    r"unsupported|not supported|does not support|unrecognized"
+    r"|unknown (?:parameter|model)|invalid (?:parameter|model)"
+    r"|extra inputs are not permitted|is not one of",
+    re.IGNORECASE,
+)
+
+
+class _Candidate(NamedTuple):
+    alias: str
+    upstream: str
+    client: Any
+    source: str
+
+
+class _Route(NamedTuple):
+    """A resolved request: the ordered models allowed to serve it."""
+
+    requested: str
+    virtual: bool
+    candidates: List[_Candidate]
+    body: Dict[str, Any]
+    reason: str
+    scope: Optional[str]
+    # Free models to try if a paid route fails on a budget/quota signal.
+    free_fallback: List[_Candidate] = []
+
+
+def sse_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def route_headers(route: _Route, cand: _Candidate) -> Optional[Dict[str, str]]:
+    """Tell the client which concrete model actually served a virtual alias."""
+    if not route.virtual:
+        return None
+    return {"X-Proxy-Model": cand.alias, "X-Proxy-Route": route.requested}
+
+
+def _no_credentials_error() -> ApiError:
+    return ApiError(
+        401,
+        "No API key provided. Enter your Portkey / AI Sandbox API key in the "
+        "Copilot app's model provider settings (it is sent as "
+        "'Authorization: ******'), or set PORTKEY_API_KEY in the "
+        "proxy's environment or .env file as a fallback.",
+        err_type="authentication_error",
+        code="missing_api_key",
+    )
+
+
+def _no_nrp_key_error() -> ApiError:
+    return ApiError(
+        401,
+        "NRP_API_KEY is not set. Add NRP_API_KEY=... to the proxy's environment "
+        "or .env file to use NRP models.",
+        err_type="authentication_error",
+        code="missing_api_key",
+    )
+
+
+def _model_not_found_error(model: str) -> ApiError:
+    available = sorted(MODEL_REGISTRY)
+    if ROUTER is not None:
+        available = sorted(available + list(routing_mod.VIRTUAL_ALIASES))
+    return ApiError(
+        404,
+        f"The model `{model}` does not exist or you do not have access to it. "
+        f"Available models: {', '.join(available)}.",
+        code="model_not_found",
+        param="model",
+    )
+
+
+async def _validated_request(request: Request, wire: str = "chat") -> _Route:
+    """Parse, authenticate and route a request body for both completions routes.
+
+    Returns the ordered models allowed to serve the request (one entry for an
+    explicit alias, or while the router is disabled), plus the body with any
+    `proxy_routing` hints removed. Raises ApiError on any problem: bad JSON,
+    missing/unknown model, no API key, or a request policy gates refuse.
     """
     try:
         body = await request.json()
@@ -1987,45 +2210,299 @@ async def _validated_request(
             "You must specify a 'model' in the request body.",
             param="model",
         )
-    if model not in MODEL_REGISTRY:
-        raise ApiError(
-            404,
-            f"The model `{model}` does not exist or you do not have access to it. "
-            f"Available models: {', '.join(sorted(MODEL_REGISTRY))}.",
-            code="model_not_found",
-            param="model",
+
+    virtual = ROUTER is not None and model in routing_mod.VIRTUAL_ALIASES
+    if model not in MODEL_REGISTRY and not virtual:
+        raise _model_not_found_error(model)
+
+    # Routing hints are a proxy-only field: they are always removed from the
+    # forwarded body, and only validated while the router is on so a disabled
+    # router keeps accepting (and stripping) exactly what it used to.
+    try:
+        hints, body = routing_mod.parse_hints(body, enforce=ROUTER is not None)
+    except routing_mod.RoutingError as exc:
+        raise ApiError(exc.status_code, exc.message, exc.err_type, exc.code, exc.param)
+
+    entry = MODEL_REGISTRY.get(model, {})
+    is_nrp_model = entry.get("api_source") == "nrp"
+    # An explicit NRP model never needs a Portkey key; anything else (including
+    # a virtual alias, which may resolve to a paid model) resolves one.
+    api_key = None if is_nrp_model else resolve_api_key(request)
+
+    if ROUTER is None:
+        # Legacy resolution, unchanged: one model, credential errors win.
+        if is_nrp_model:
+            # NRP models use a fixed key from the environment (not the request
+            # key) and are served by a plain OpenAI client (****** against
+            # the NRP gateway; the Portkey SDK's x-portkey-api-key scheme gets
+            # 403s.
+            if not NRP_API_KEY:
+                raise _no_nrp_key_error()
+            client = get_nrp_client()
+        else:
+            if not api_key:
+                raise _no_credentials_error()
+            client = get_portkey_client(api_key)
+        return _Route(
+            requested=model,
+            virtual=False,
+            candidates=[
+                _Candidate(
+                    model,
+                    entry["upstream"],
+                    client,
+                    entry.get("api_source", "portkey"),
+                )
+            ],
+            body=body,
+            reason="",
+            scope=routing_mod.Router.scope(api_key, "portkey") if api_key else None,
         )
 
-    entry = MODEL_REGISTRY[model]
-    if entry.get("api_source") == "nrp":
-        # NRP models use a fixed key from the environment (not the request key)
-        # and are served by a plain OpenAI client (Bearer auth) against the
-        # NRP gateway; the Portkey SDK's x-portkey-api-key scheme gets 403s.
-        if not NRP_API_KEY:
-            raise ApiError(
-                401,
-                "NRP_API_KEY is not set. Add NRP_API_KEY=... to the proxy's "
-                "environment or .env file to use NRP models.",
-                err_type="authentication_error",
-                code="missing_api_key",
-            )
-        client = get_nrp_client()
-        return client, model, entry["upstream"], body
+    try:
+        plan = ROUTER.plan(
+            model,
+            wire=wire,
+            body=body,
+            hints=hints,
+            have_portkey_key=bool(api_key),
+            have_nrp_key=bool(NRP_API_KEY),
+            portkey_scope=routing_mod.Router.scope(api_key, "portkey") if api_key else None,
+        )
+    except routing_mod.RoutingError as exc:
+        raise ApiError(exc.status_code, exc.message, exc.err_type, exc.code, exc.param)
 
-    api_key = resolve_api_key(request)
-    if not api_key:
+    def _reachable(aliases: List[str]) -> List[_Candidate]:
+        """Candidates for a virtual route, skipping models it cannot call."""
+        out: List[_Candidate] = []
+        for alias in aliases:
+            ent = MODEL_REGISTRY[alias]
+            if ent.get("api_source") == "nrp":
+                if NRP_API_KEY:
+                    out.append(
+                        _Candidate(alias, ent["upstream"], get_nrp_client(), "nrp")
+                    )
+            elif api_key:
+                out.append(
+                    _Candidate(
+                        alias,
+                        ent["upstream"],
+                        get_portkey_client(api_key),
+                        "portkey",
+                    )
+                )
+        return out
+
+    candidates: List[_Candidate] = []
+    for alias in plan.candidates:
+        cand_entry = MODEL_REGISTRY[alias]
+        if cand_entry.get("api_source") == "nrp":
+            if not NRP_API_KEY:
+                # An explicit NRP model keeps its legacy 401; a virtual route
+                # simply drops the unreachable model from the list.
+                if not plan.virtual:
+                    raise _no_nrp_key_error()
+                continue
+            candidates.append(
+                _Candidate(alias, cand_entry["upstream"], get_nrp_client(), "nrp")
+            )
+            continue
+        if not api_key:
+            if not plan.virtual:
+                raise _no_credentials_error()
+            continue
+        candidates.append(
+            _Candidate(
+                alias, cand_entry["upstream"], get_portkey_client(api_key), "portkey"
+            )
+        )
+    if not candidates:
         raise ApiError(
             401,
-            "No API key provided. Enter your Portkey / AI Sandbox API key in the "
-            "Copilot app's model provider settings (it is sent as "
-            "'Authorization: ******'), or set PORTKEY_API_KEY in the "
-            "proxy's environment or .env file as a fallback.",
+            "No credentials are configured for any model the router may use. "
+            "Set NRP_API_KEY for the free models, and send a Portkey key (or "
+            "set PORTKEY_API_KEY) for the paid ones.",
             err_type="authentication_error",
             code="missing_api_key",
         )
 
-    client = get_portkey_client(api_key)
-    return client, model, entry["upstream"], body
+    logging.info("router: %s", plan.reason())
+    free_fallback: List[_Candidate] = []
+    if plan.virtual and plan.gate in ("hard", "review") and plan.pinned is None:
+        # Keep the free tier behind a paid-only route: the budget policy is to
+        # serve the request for free rather than fail it when the paid wallet
+        # runs out mid-flight.
+        chosen = {c.alias for c in candidates}
+        free_fallback = [
+            cand
+            for cand in _reachable(
+                ROUTER.free_fallback(
+                    wire=wire,
+                    body=body,
+                    have_portkey_key=bool(api_key),
+                    have_nrp_key=bool(NRP_API_KEY),
+                    portkey_scope=(
+                        routing_mod.Router.scope(api_key, "portkey") if api_key else None
+                    ),
+                )
+            )
+            if cand.alias not in chosen
+        ]
+    return _Route(
+        requested=model,
+        virtual=plan.virtual,
+        candidates=candidates,
+        body=body,
+        reason=plan.reason(),
+        scope=routing_mod.Router.scope(api_key, "portkey") if api_key else None,
+        free_fallback=free_fallback,
+    )
+
+
+def _note_route_failure(
+    route: _Route, cand: _Candidate, failure: _AttemptFailure
+) -> None:
+    """Restrict the rest of this request to free models on verified exhaustion.
+
+    Only the paid upstream can prove the monthly budget is gone; an NRP 402/429
+    is unrelated to the Portkey bill and is ignored here.
+    """
+    if ROUTER is None or cand.source != "portkey":
+        return
+    if not routing_mod.is_quota_exhaustion(
+        failure.status_code, str(failure), failure.code
+    ):
+        return
+    ROUTER.mark_exhausted(route.scope or ROUTER.scope(None, "portkey"), str(failure))
+
+
+async def _prime_stream(frames: Any) -> Tuple[Optional[str], Optional[_AttemptFailure]]:
+    """Pull the first SSE frame before committing to this attempt.
+
+    Returns (frame, None) once the upstream has proved it can serve the
+    request, or (None, failure) while the response is still rewindable. An
+    empty stream counts as a failure so the next candidate is tried. Nothing
+    reaches the client before this resolves, which is what keeps the fallback
+    honest: no replay after streaming begins.
+    """
+    try:
+        first = await run_in_threadpool(next, frames, None)
+    except _AttemptFailure as exc:
+        return None, exc
+    except Exception as exc:  # noqa: BLE001
+        return None, _AttemptFailure.from_exception(exc)
+    if first is None:
+        return None, _AttemptFailure(502, "Upstream returned an empty stream.")
+    return first, None
+
+
+def _frames_with_head(head: str, rest: Any) -> Generator[str, None, None]:
+    try:
+        yield head
+        yield from rest
+    finally:
+        _close_stream(rest)
+
+
+def _close_stream(stream: Any) -> None:
+    close = getattr(stream, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            logging.warning("Could not close upstream stream", exc_info=True)
+
+
+def _payload_failure(data: Dict[str, Any], status: int = 502) -> Optional[_AttemptFailure]:
+    error = data.get("error")
+    if data.get("type") == "error":
+        error = data
+    elif data.get("type") == "response.failed":
+        error = (data.get("response") or {}).get("error")
+    if not isinstance(error, dict):
+        return None
+    return _AttemptFailure(
+        status, str(error.get("message") or "Upstream stream failed."),
+        str(error.get("type") or "api_error"), error.get("code"), error.get("param"),
+    )
+
+
+def _observe_route_response(route: _Route, cand: _Candidate, response: Response) -> Response:
+    """Observe explicit failures and committed stream errors without replay."""
+    if ROUTER is None or cand.source != "portkey" or isinstance(response, StreamingResponse):
+        return response
+    if response.status_code >= 400:
+        failure = _payload_failure(json.loads(response.body), response.status_code)
+        if failure:
+            _note_route_failure(route, cand, failure)
+    return response
+
+
+async def _run_routed(route: _Route, dispatch: Any, *, stream: bool, wire: str = "chat") -> Response:
+    """Try the route's candidates in order, at most max_attempts times.
+
+    `dispatch(cand, headers)` returns a committed Response or raises
+    _AttemptFailure / ApiError. The first non-retryable failure ends the loop;
+    if every attempt fails the last failure is returned in the shape the
+    client asked for (JSON body, or an SSE error stream).
+    """
+    assert ROUTER is not None
+    started = time.monotonic()
+    limit = ROUTER.max_attempts
+    exhausted_scope = route.scope or ROUTER.scope(None, "portkey")
+    last_failure: Optional[_AttemptFailure] = None
+    tried = 0
+    candidates = list(route.candidates)
+    fallback_added = False
+    for cand in candidates:
+        if tried >= limit:
+            break
+        if time.monotonic() - started >= ROUTER.deadline_seconds:
+            logging.warning("router: deadline exceeded after %d attempt(s)", tried)
+            break
+        if cand.source == "portkey" and ROUTER.scope_exhausted(exhausted_scope):
+            # The paid wallet is empty: don't burn another round trip on it.
+            last_failure = _AttemptFailure(
+                402,
+                f"Skipped paid model `{cand.alias}`: the upstream reported the "
+                "monthly quota is exhausted.",
+                code="budget_exhausted",
+            )
+            if not fallback_added:
+                candidates.extend(route.free_fallback)
+                fallback_added = True
+            continue
+        tried += 1
+        try:
+            response = await dispatch(cand, route_headers(route, cand))
+            return _observe_route_response(route, cand, response)
+        except ApiError as exc:
+            failure = _AttemptFailure.from_api_error(exc)
+        except _AttemptFailure as exc:
+            failure = exc
+        last_failure = failure
+        _note_route_failure(route, cand, failure)
+        if not failure.retryable:
+            break
+        if cand.source == "portkey" and failure.policy and not fallback_added:
+            candidates.extend(route.free_fallback)
+            fallback_added = True
+        logging.warning(
+            "router: model=%s failed (status=%s): %s",
+            cand.alias,
+            failure.status_code,
+            str(failure)[:300],
+        )
+    if last_failure is None:
+        raise ApiError(
+            400,
+            "The router found no model eligible to serve this request.",
+            code="no_eligible_model",
+        )
+    return last_failure.as_sse(wire) if stream else last_failure.as_json()
+
+
+# ----------------------------- chat completions ---------------------------- #
 
 
 def _sse_stream(
@@ -2033,22 +2510,33 @@ def _sse_stream(
     upstream: str,
     alias: str,
     attempts: List[Dict[str, Any]],
+    surface_errors: bool = False,
+    failure_callback: Any = None,
 ) -> Generator[str, None, None]:
     """Run the SDK stream and re-emit OpenAI SSE chunks.
 
     `attempts` holds one or two request-kwargs variants; when function tools
     are present, the second variant is tried if the upstream rejects the
     first with the tools+reasoning conflict (before any chunk was sent).
+
+    With `surface_errors` (routed requests only) a failure that happens
+    before the first chunk is raised instead of being streamed, so the router
+    can still switch models; after that point the response is committed and
+    the legacy error frame is used.
     """
     yielded_any = False
     recorded_usage = False
+    stream = None
     try:
         stream = client.chat.completions.create(
             model=upstream, stream=True, **attempts[0]
         )
         for chunk in stream:
-            yielded_any = True
             data = to_json_dict(chunk)
+            failure = _payload_failure(data)
+            if failure:
+                raise failure
+            yielded_any = True
             data["model"] = alias  # report the name the client asked for
             if (
                 not recorded_usage
@@ -2058,6 +2546,8 @@ def _sse_stream(
                 recorded_usage = True
                 _track_usage(alias, data["usage"], stream=True)
             yield sse_frame(data)
+        if surface_errors and not yielded_any:
+            raise _AttemptFailure(502, "Upstream returned an empty stream.")
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
         status, message, err_type, code, param = _exception_details(exc)
         if (
@@ -2070,8 +2560,14 @@ def _sse_stream(
                 message,
                 _reasoning_desc(attempts[1]),
             )
-            yield from _sse_stream(client, upstream, alias, attempts[1:])
+            yield from _sse_stream(
+                client, upstream, alias, attempts[1:], surface_errors, failure_callback
+            )
             return
+        if surface_errors and not yielded_any:
+            raise _AttemptFailure(status, message, err_type, code, param)
+        if failure_callback:
+            failure_callback(_AttemptFailure(status, message, err_type, code, param))
         if status >= 500:
             logging.exception("Upstream stream failed (status=%s)", status)
         else:
@@ -2079,6 +2575,8 @@ def _sse_stream(
         yield sse_frame(
             {"error": _error_payload(message, err_type, code, param)["error"]}
         )
+    finally:
+        _close_stream(stream)
     yield "data: [DONE]\n\n"
 
 
@@ -2104,18 +2602,27 @@ def _sse_bridged_stream(
     upstream: str,
     alias: str,
     kwargs: Dict[str, Any],
+    surface_errors: bool = False,
+    failure_callback: Any = None,
 ) -> Generator[str, None, None]:
     """Stream the Responses API and re-emit chat-completion SSE chunks.
 
     The client sees an ordinary chat stream: role delta, content/tool_calls
     deltas, finish_reason, optional usage, then `data: [DONE]`.
+
+    `surface_errors` raises pre-commit failures (see `_sse_stream`).
     """
     translator = _ResponsesToChatSSE(alias)
     recorded_usage = False
+    yielded_any = False
+    stream = None
     try:
         stream = client.responses.create(model=upstream, stream=True, **kwargs)
         for event in stream:
             data = to_json_dict(event)
+            failure = _payload_failure(data)
+            if failure:
+                raise failure
             if not recorded_usage:
                 usage: Any = data.get("usage")
                 if not isinstance(usage, dict) or not usage:
@@ -2126,9 +2633,16 @@ def _sse_bridged_stream(
                     recorded_usage = True
                     _track_usage(alias, usage, stream=True)
             for frame in translator.consume(data):
+                yielded_any = True
                 yield frame
+        if surface_errors and not yielded_any:
+            raise _AttemptFailure(502, "Upstream returned an empty stream.")
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
         status, message, err_type, code, param = _exception_details(exc)
+        if surface_errors and not yielded_any:
+            raise _AttemptFailure(status, message, err_type, code, param)
+        if failure_callback:
+            failure_callback(_AttemptFailure(status, message, err_type, code, param))
         if status >= 500:
             logging.exception("Bridged responses stream failed (status=%s)", status)
         else:
@@ -2140,14 +2654,27 @@ def _sse_bridged_stream(
         )
         yield "data: [DONE]\n\n"
         return
+    finally:
+        _close_stream(stream)
     for frame in translator.finish():
         yield frame
 
 
-@app.post("/v1/chat/completions")
-@app.post("/chat/completions")
-async def chat_completions(request: Request):
-    client, alias, upstream, body = await _validated_request(request)
+async def _dispatch_chat(
+    cand: _Candidate,
+    body: Dict[str, Any],
+    extra_headers: Optional[Dict[str, str]] = None,
+    *,
+    surface_errors: bool = False,
+    failure_callback: Any = None,
+) -> Response:
+    """Send one chat-completions request to one concrete model.
+
+    Returns a committed response. With `surface_errors` set (routed requests),
+    any failure that happens before the client is committed raises
+    `_AttemptFailure` instead, so the router can try another model.
+    """
+    alias, upstream, client = cand.alias, cand.upstream, cand.client
     stream = bool(body.get("stream", False))
 
     # Forward all remaining parameters untouched (temperature, max_tokens,
@@ -2194,21 +2721,29 @@ async def chat_completions(request: Request):
                     alias,
                     message,
                 )
+                if surface_errors:
+                    raise _AttemptFailure(status, message, err_type, code, param)
                 return JSONResponse(
                     status_code=status,
                     content=_error_payload(message, err_type, code, param),
                 )
             raw = to_json_dict(bridged)
             _track_usage(alias, raw.get("usage"), stream=False)
-            return JSONResponse(_responses_to_chat_completion(raw, alias))
+            return JSONResponse(
+                _responses_to_chat_completion(raw, alias), headers=extra_headers
+            )
+        frames = _sse_bridged_stream(
+            client, upstream, alias, resp_kwargs, surface_errors, failure_callback
+        )
+        if surface_errors:
+            first, failure = await _prime_stream(frames)
+            if failure is not None:
+                raise failure
+            frames = _frames_with_head(first, frames)
         return StreamingResponse(
-            _sse_bridged_stream(client, upstream, alias, resp_kwargs),
+            frames,
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+            headers=sse_headers(extra_headers),
         )
 
     attempts = _tools_reasoning_plan(kwargs, caps)
@@ -2264,6 +2799,8 @@ async def chat_completions(request: Request):
                 break
         if data is None:
             status, message, err_type, code, param = failure
+            if surface_errors:
+                raise _AttemptFailure(status, message, err_type, code, param)
             return JSONResponse(
                 status_code=status,
                 content=_error_payload(message, err_type, code, param),
@@ -2271,19 +2808,43 @@ async def chat_completions(request: Request):
         data["model"] = alias
         data.setdefault("object", "chat.completion")
         _track_usage(alias, data.get("usage"), stream=False)
-        return JSONResponse(data)
+        return JSONResponse(data, headers=extra_headers)
 
-    # Streaming: headers are sent before the request is made, so upstream
-    # errors are surfaced as SSE error frames followed by [DONE].
+    # Streaming: the response is only returned once the attempt is committed,
+    # so a routed request can still fall back; a non-routed one keeps the
+    # legacy behaviour of error frames inside the stream.
+    frames = _sse_stream(client, upstream, alias, attempts, surface_errors, failure_callback)
+    if surface_errors:
+        first, stream_failure = await _prime_stream(frames)
+        if stream_failure is not None:
+            raise stream_failure
+        frames = _frames_with_head(first, frames)
     return StreamingResponse(
-        _sse_stream(client, upstream, alias, attempts),
+        frames,
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers=sse_headers(extra_headers),
     )
+
+
+@app.post("/v1/chat/completions")
+@app.post("/chat/completions")
+async def chat_completions(request: Request):
+    route = await _validated_request(request, "chat")
+    if route.virtual:
+        return await _run_routed(
+            route,
+            lambda cand, headers: _dispatch_chat(
+                cand, route.body, headers, surface_errors=True,
+                failure_callback=lambda failure: _note_route_failure(route, cand, failure),
+            ),
+            stream=bool(route.body.get("stream", False)),
+        )
+    cand = route.candidates[0]
+    response = await _dispatch_chat(
+        cand, route.body, route_headers(route, cand),
+        failure_callback=lambda failure: _note_route_failure(route, cand, failure),
+    )
+    return _observe_route_response(route, cand, response)
 
 
 # ------------------------------- usage report ------------------------------ #
@@ -2302,23 +2863,53 @@ async def get_usage(month: Optional[str] = None):
 # ------------------------------- models list ------------------------------- #
 
 
+def _model_entry(name: str, created: int, owned_by: str) -> Dict[str, Any]:
+    return {
+        "id": name,
+        "object": "model",
+        "created": created,
+        "owned_by": owned_by,
+        "permission": [],
+    }
+
+
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models():
     created_now = int(time.time())
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": name,
-                "object": "model",
-                "created": created_now,
-                "owned_by": "princeton-ai-sandbox",
-                "permission": [],
-            }
-            for name in sorted(MODEL_REGISTRY)
-        ],
-    }
+    data = [
+        _model_entry(name, created_now, "princeton-ai-sandbox")
+        for name in sorted(MODEL_REGISTRY)
+    ]
+    if ROUTER is not None:
+        # The virtual aliases are requestable models, so advertise them too.
+        data += [
+            _model_entry(alias, created_now, "portkey-proxy-router")
+            for alias in routing_mod.VIRTUAL_ALIASES
+        ]
+    return {"object": "list", "data": data}
+
+
+@app.get("/v1/router")
+@app.get("/router")
+async def router_status():
+    """Which models each virtual alias resolves to, and the gate state.
+
+    Reports config, spend, and exhaustion only — never request content.
+    """
+    if ROUTER is None:
+        return {"enabled": False}
+    return ROUTER.status()
+
+
+@app.post("/v1/router/reset")
+@app.post("/router/reset")
+async def router_reset():
+    """Clear the paid-scope exhaustion note (e.g. after the quota is raised)."""
+    if ROUTER is None:
+        return {"enabled": False}
+    ROUTER.reset_exhaustion()
+    return {"enabled": True, "exhausted_scopes": []}
 
 
 @app.get("/health")
@@ -2326,8 +2917,10 @@ async def health():
     return {
         "status": "ok",
         "version": PROXY_VERSION,
-        "models": sorted(MODEL_REGISTRY),
+        "models": sorted(MODEL_REGISTRY)
+        + (sorted(routing_mod.VIRTUAL_ALIASES) if ROUTER is not None else []),
         "fallback_key_configured": bool(FALLBACK_API_KEY),
+        "router_enabled": ROUTER is not None,
     }
 
 
@@ -2343,6 +2936,7 @@ async def root():
             "responses": "POST /v1/responses",
             "models": "GET /v1/models",
             "usage": "GET /v1/usage",
+            "router": "GET /v1/router",
         },
     }
 
@@ -2371,6 +2965,8 @@ def _sse_responses_stream(
     upstream: str,
     alias: str,
     kwargs: Dict[str, Any],
+    surface_errors: bool = False,
+    failure_callback: Any = None,
 ) -> Generator[str, None, None]:
     """Run the SDK Responses stream and re-emit typed OpenAI SSE events.
 
@@ -2378,12 +2974,20 @@ def _sse_responses_stream(
     ends with a `response.completed` event, which also carries the usage block.
     There is no tools+reasoning conflict on this endpoint, so a single request
     variant is used (no _tools_reasoning_plan retry ladder).
+
+    `surface_errors` raises pre-commit failures so the router can switch
+    models (see `_sse_stream`).
     """
     recorded_usage = False
+    yielded_any = False
+    stream = None
     try:
         stream = client.responses.create(model=upstream, stream=True, **kwargs)
         for event in stream:
             data = _rewrite_response_models(to_json_dict(event), alias)
+            failure = _payload_failure(data)
+            if failure:
+                raise failure
             if not recorded_usage:
                 usage: Any = data.get("usage")
                 if not isinstance(usage, dict) or not usage:
@@ -2393,9 +2997,16 @@ def _sse_responses_stream(
                 if isinstance(usage, dict) and usage:
                     recorded_usage = True
                     _track_usage(alias, usage, stream=True)
+            yielded_any = True
             yield sse_event_frame(data)
+        if surface_errors and not yielded_any:
+            raise _AttemptFailure(502, "Upstream returned an empty stream.")
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
         status, message, err_type, code, param = _exception_details(exc)
+        if surface_errors and not yielded_any:
+            raise _AttemptFailure(status, message, err_type, code, param)
+        if failure_callback:
+            failure_callback(_AttemptFailure(status, message, err_type, code, param))
         if status >= 500:
             logging.exception("Upstream responses stream failed (status=%s)", status)
         else:
@@ -2410,6 +3021,8 @@ def _sse_responses_stream(
                 "param": param,
             }
         )
+    finally:
+        _close_stream(stream)
 
 
 def _sse_nrp_responses_stream(
@@ -2417,27 +3030,51 @@ def _sse_nrp_responses_stream(
     upstream: str,
     alias: str,
     kwargs: Dict[str, Any],
+    surface_errors: bool = False,
+    failure_callback: Any = None,
 ) -> Generator[str, None, None]:
     """Stream NRP chat completions and re-emit them as Responses SSE events.
 
     The upstream has no working /v1/responses, so the reply is translated from
     chat chunks. Like real Responses streams it ends with `response.completed`
     (carrying usage) and never sends `data: [DONE]`.
+
+    The synthetic start events are normally emitted first, but a routed
+    attempt (`surface_errors`) holds them back until the upstream has accepted
+    the request: sending them would commit the response and make a model
+    switch impossible.
     """
     translator = _ChatToResponsesSSE(alias, upstream)
-    for frame in translator.start_events():
-        yield frame
     kwargs = _nrp_chat_kwargs(client, kwargs)
+    emitted = False
+    stream = None
+    if not surface_errors:
+        for frame in translator.start_events():
+            yield frame
+        emitted = True
     try:
         stream = client.chat.completions.create(
             model=upstream, stream=True, **kwargs
         )
         for chunk in stream:
             data = to_json_dict(chunk)
+            failure = _payload_failure(data)
+            if failure:
+                raise failure
+            if not emitted:
+                # Creating an iterator is not acceptance: wait for upstream data.
+                emitted = True
+                yield from translator.start_events()
             for frame in translator.consume(data):
                 yield frame
+        if surface_errors and not emitted:
+            raise _AttemptFailure(502, "Upstream returned an empty stream.")
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
         status, message, err_type, code, param = _exception_details(exc)
+        if surface_errors and not emitted:
+            raise _AttemptFailure(status, message, err_type, code, param)
+        if failure_callback:
+            failure_callback(_AttemptFailure(status, message, err_type, code, param))
         if status >= 500:
             logging.exception("NRP bridge stream failed (status=%s)", status)
         else:
@@ -2446,23 +3083,71 @@ def _sse_nrp_responses_stream(
             {"type": "error", "message": message, "code": code, "param": param}
         )
         return
+    finally:
+        _close_stream(stream)
     for frame in translator.finish():
         yield frame
 
 
-@app.post("/v1/responses")
-@app.post("/responses")
-async def responses_create(request: Request):
-    if not RESPONSES_ENABLED:
-        raise ApiError(
-            404,
-            "The OpenAI Responses API is disabled on this proxy "
-            "(set RESPONSES_ENABLED=1 to enable it). Use "
-            "POST /v1/chat/completions instead.",
-            code="unsupported_endpoint",
-        )
-    client, alias, upstream, body = await _validated_request(request)
+def _response_id_from_frame(frame: str) -> Optional[str]:
+    """Extract a response id from one SSE frame, if it carries one."""
+    for line in frame.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            payload = json.loads(line[len("data:") :].strip())
+        except Exception:  # noqa: BLE001 - `data: [DONE]` and partial frames
+            return None
+        if not isinstance(payload, dict):
+            continue
+        for candidate in (payload, payload.get("response")):
+            if isinstance(candidate, dict):
+                rid = candidate.get("id")
+                if isinstance(rid, str) and rid:
+                    return rid
+    return None
+
+
+def _pin_response_stream(frames: Any, alias: str) -> Generator[str, None, None]:
+    """Remember which model owns a streamed Responses thread.
+
+    A later request carrying `previous_response_id` must go back to the same
+    model, so the id is learned from the first frame that contains it.
+    """
+    pinned = False
+    try:
+        for frame in frames:
+            if not pinned:
+                rid = _response_id_from_frame(frame)
+                if rid:
+                    if ROUTER is not None:
+                        ROUTER.remember_response(rid, alias)
+                    pinned = True
+            yield frame
+    finally:
+        _close_stream(frames)
+
+
+async def _dispatch_responses(
+    cand: _Candidate,
+    body: Dict[str, Any],
+    extra_headers: Optional[Dict[str, str]] = None,
+    *,
+    surface_errors: bool = False,
+    pin: bool = False,
+    failure_callback: Any = None,
+) -> Response:
+    """Send one /v1/responses request to one concrete model.
+
+    See `_dispatch_chat` for the `surface_errors` contract; `pin` records the
+    response id against the winning model for stateful continuations.
+    """
+    alias, upstream, client = cand.alias, cand.upstream, cand.client
     stream = bool(body.get("stream", False))
+
+    def _remember(response_id: Any) -> None:
+        if pin and ROUTER is not None:
+            ROUTER.remember_response(response_id, alias)
 
     if MODEL_REGISTRY[alias].get("responses_via_chat"):
         # The upstream has no working Responses API (NRP's /v1/responses is a
@@ -2471,7 +3156,6 @@ async def responses_create(request: Request):
         kwargs, _names, note = _responses_to_chat_kwargs(body)
         if stream and INCLUDE_STREAM_USAGE:
             kwargs.setdefault("stream_options", {"include_usage": True})
-        kwargs = _nrp_chat_kwargs(client, kwargs)
         logging.info(
             "responses request bridged via chat: model=%s stream=%s tools=%s%s",
             alias,
@@ -2480,6 +3164,7 @@ async def responses_create(request: Request):
             f" ({note})" if note else "",
         )
         if not stream:
+            kwargs = _nrp_chat_kwargs(client, kwargs)
             try:
                 response = await run_in_threadpool(
                     client.chat.completions.create, model=upstream, **kwargs
@@ -2492,23 +3177,30 @@ async def responses_create(request: Request):
                     alias,
                     message,
                 )
+                if surface_errors:
+                    raise _AttemptFailure(status, message, err_type, code, param)
                 return JSONResponse(
                     status_code=status,
                     content=_error_payload(message, err_type, code, param),
                 )
-            data = _chat_to_responses_completion(
-                to_json_dict(response), alias
-            )
+            data = _chat_to_responses_completion(to_json_dict(response), alias)
             _track_usage(alias, data.get("usage"), stream=False)
-            return JSONResponse(data)
+            _remember(data.get("id"))
+            return JSONResponse(data, headers=extra_headers)
+        frames = _sse_nrp_responses_stream(
+            client, upstream, alias, kwargs, surface_errors, failure_callback
+        )
+        if surface_errors:
+            first, failure = await _prime_stream(frames)
+            if failure is not None:
+                raise failure
+            frames = _frames_with_head(first, frames)
+        if pin:
+            frames = _pin_response_stream(frames, alias)
         return StreamingResponse(
-            _sse_nrp_responses_stream(client, upstream, alias, kwargs),
+            frames,
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+            headers=sse_headers(extra_headers),
         )
 
     caps = reasoning_caps(alias)
@@ -2536,6 +3228,8 @@ async def responses_create(request: Request):
                 alias,
                 message,
             )
+            if surface_errors:
+                raise _AttemptFailure(status, message, err_type, code, param)
             return JSONResponse(
                 status_code=status,
                 content=_error_payload(message, err_type, code, param),
@@ -2543,19 +3237,55 @@ async def responses_create(request: Request):
         data = _rewrite_response_models(to_json_dict(response), alias)
         data.setdefault("object", "response")
         _track_usage(alias, data.get("usage"), stream=False)
-        return JSONResponse(data)
+        _remember(data.get("id"))
+        return JSONResponse(data, headers=extra_headers)
 
     # Streaming: headers are sent before the request is made, so upstream
-    # errors are surfaced as a typed SSE error event.
+    # errors are surfaced as a typed SSE error event. A routed attempt primes
+    # the stream first so it can still fall back to another model.
+    frames = _sse_responses_stream(client, upstream, alias, kwargs, surface_errors, failure_callback)
+    if surface_errors:
+        first, failure = await _prime_stream(frames)
+        if failure is not None:
+            raise failure
+        frames = _frames_with_head(first, frames)
+    if pin:
+        frames = _pin_response_stream(frames, alias)
     return StreamingResponse(
-        _sse_responses_stream(client, upstream, alias, kwargs),
+        frames,
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers=sse_headers(extra_headers),
     )
+
+
+@app.post("/v1/responses")
+@app.post("/responses")
+async def responses_create(request: Request):
+    if not RESPONSES_ENABLED:
+        raise ApiError(
+            404,
+            "The OpenAI Responses API is disabled on this proxy "
+            "(set RESPONSES_ENABLED=1 to enable it). Use "
+            "POST /v1/chat/completions instead.",
+            code="unsupported_endpoint",
+        )
+    route = await _validated_request(request, "responses")
+    if route.virtual:
+        return await _run_routed(
+            route,
+            lambda cand, headers: _dispatch_responses(
+                cand, route.body, headers, surface_errors=True, pin=True,
+                failure_callback=lambda failure: _note_route_failure(route, cand, failure),
+            ),
+            stream=bool(route.body.get("stream", False)),
+            wire="responses",
+        )
+    cand = route.candidates[0]
+    response = await _dispatch_responses(
+        cand, route.body, route_headers(route, cand),
+        failure_callback=lambda failure: _note_route_failure(route, cand, failure),
+    )
+    return _observe_route_response(route, cand, response)
 
 
 # ------------------------------ error handlers ----------------------------- #
@@ -2609,6 +3339,10 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        # The router logs at import time, which makes an argument-less
+        # basicConfig() install a WARNING-level handler first; force=True
+        # keeps INFO visible either way.
+        force=True,
     )
     parser = argparse.ArgumentParser(description="Portkey OpenAI-compatible proxy")
     parser.add_argument(
