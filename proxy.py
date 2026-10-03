@@ -396,9 +396,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "responses_via_chat": True,
         "track_usage": False,
         "provider": "openai",
-        # No vision on this deployment: the router starts image requests on
-        # deepseek-v4-flash instead (still first in the free pool otherwise).
-        "capabilities": {"image": False},
+        # Vision verified live 2026-10-02 (Qwen3.8-Flash-Next-FP8 is a
+        # multimodal "Causal Language Model with Vision Encoder"; the NRP
+        # catalog lists image + video input), so no `capabilities` entry is
+        # needed and image requests stay on qwen3 by default.
     },
     "deepseek-v4-flash": {
         "upstream": os.environ.get(

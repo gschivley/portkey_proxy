@@ -207,8 +207,9 @@ pip install -r requirements.txt
   `claude-opus-5-5` first, and `DEFAULT_OPT_IN_ALIASES` (`claude-fable-5-1`)
   stay out of every default pool but work when named explicitly. Modality
   capabilities may be declared on registry entries (`capabilities`, e.g.
-  `qwen3: {image: false}` → vision requests fall through to
-  `deepseek-v4-flash`); router-config `capabilities` override them.
+  `{"image": false}` skips a model for vision requests) but none are declared
+  for shipped models — qwen3 is multimodal (verified live); router-config
+  `capabilities` override the registry.
   `allow_paid: false` is a hard veto that outranks the alias (`auto-hard` with
   the veto is served by the free pool), while an explicitly named paid model
   with the veto is a 400. Capability filtering may only *exclude* a candidate —

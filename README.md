@@ -233,9 +233,8 @@ and with the router off (the default) nothing changes at all.
 | `auto-review` | review pool (default: same as hard) | code review / final checks |
 
 - **free pool** — `qwen3`, `deepseek-v4-flash`, `glm-5` (zero cost). `qwen3` is
-  the default pick; it declares no image input, so vision requests start on
-  `deepseek-v4-flash` instead (and any free model that errors over falls back
-  to the next one).
+  the default pick and handles image input itself (verified live against the
+  NRP deployment); any free model that errors over falls back to the next one.
 - **paid pool** — curated default: `gpt-6.1-sol` first (cost-conscious complex
   work), then `claude-opus-5-5`, then the remaining Portkey models in
   `MODEL_REGISTRY` order. `claude-fable-5-1` is **opt-in only**: it sits out of
@@ -281,9 +280,10 @@ A candidate is skipped when it cannot honour the request as sent — the proxy
 never silently drops content or parameters to make a model fit:
 
 - function tools on a model that has none
-- image/audio input on a model declared without it (the registry declares
-  `qwen3: {image: false}`; add or change extras in the config file's
-  `capabilities`, which overrides the registry)
+- image/audio input on a model declared without it (modality caps are
+  declared per alias in the registry's optional `capabilities` field, e.g.
+  `{"image": false}`; add or change them in the config file's `capabilities`,
+  which overrides the registry)
 - Responses-only parameters (`previous_response_id`, `store`, `background`,
   `include`, `prompt`, `truncation`, `service_tier`, …), native tool types
   (`web_search`, `mcp`, `shell`, …), item references, files, unknown input/content

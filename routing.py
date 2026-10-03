@@ -49,7 +49,7 @@ Configuration (environment / .env):
 
 JSON config file (all keys optional):
     {"pools": {"free": [...], "paid": [...], "hard": [...], "review": [...]},
-     "capabilities": {"qwen3": {"image": false}},
+     "capabilities": {"model-name": {"image": false}},
      "native_only_params": ["previous_response_id", "store", ...],
      "max_attempts": 4,
      "paid_approval_threshold_usd": 230,
@@ -644,7 +644,7 @@ class Router:
             "stateful_responses": not nrp,
             "tools": True,
         }
-        # Registry-declared modality defaults (e.g. qwen3 has no image input),
+        # Registry-declared modality defaults (e.g. a text-only deployment),
         # then router config on top so either can be overridden by operators.
         caps.update(entry.get("capabilities") or {})
         caps.update(self.capabilities.get(alias) or {})

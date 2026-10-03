@@ -2254,8 +2254,8 @@ def main() -> int:
             },
         )
         check(
-            "router defaults: vision request skips qwen3, serves deepseek-v4-flash",
-            r.status_code == 200 and r.headers.get("x-proxy-model") == "deepseek-v4-flash",
+            "router defaults: vision request served by qwen3 (multimodal)",
+            r.status_code == 200 and r.headers.get("x-proxy-model") == "qwen3",
             f"{r.status_code} {r.headers.get('x-proxy-model')}",
         )
         reset_attempts()

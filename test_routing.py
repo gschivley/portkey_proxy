@@ -44,7 +44,6 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
         "api_source": "nrp",
         "responses_via_chat": True,
         "track_usage": False,
-        "capabilities": {"image": False},
     },
     "deepseek-v4-flash": {
         "upstream": "deepseek-v4-flash",
@@ -58,6 +57,10 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
         "provider": "openai",
         "api_source": "nrp",
         "responses_via_chat": True,
+        # Synthetic fixture only: exercises the registry-declared
+        # `capabilities` filtering mechanism. The real registry does not
+        # declare capabilities for any shipped model (qwen3 is multimodal).
+        "capabilities": {"image": False},
         "track_usage": False,
     },
 }
@@ -550,9 +553,9 @@ def main() -> int:
     }
     p = plan(make_router(0.0, max_attempts=8), "auto-free", body=img_body)
     check(
-        "vision: chat image request skips qwen3, starts on deepseek",
-        p.candidates == ["deepseek-v4-flash", "glm-5"] + PAID
-        and ("qwen3", "no-image") in p.skipped,
+        "vision: chat image request skips the capability-declared model",
+        p.candidates == ["qwen3", "deepseek-v4-flash"] + PAID
+        and ("glm-5", "no-image") in p.skipped,
         str(p.skipped),
     )
     p = plan(
@@ -563,14 +566,14 @@ def main() -> int:
     )
     check(
         "vision: responses wire detects input_image",
-        p.candidates == ["deepseek-v4-flash", "glm-5"] + PAID,
+        p.candidates == ["qwen3", "deepseek-v4-flash"] + PAID,
         str(p.candidates),
     )
-    r = make_router(0.0, config={"capabilities": {"qwen3": {"image": True}}})
+    r = make_router(0.0, config={"capabilities": {"glm-5": {"image": True}}})
     p = plan(r, "auto-free", body=img_body, have_nrp_key=True)
     check(
-        "vision: config can re-admit qwen3 for images",
-        p.candidates[0] == "qwen3",
+        "vision: config can re-admit a capability-excluded model",
+        ("glm-5", "no-image") not in p.skipped and "glm-5" in p.candidates,
         str(p.candidates),
     )
     with tempfile.TemporaryDirectory() as tmp:
