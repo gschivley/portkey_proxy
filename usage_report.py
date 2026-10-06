@@ -62,6 +62,16 @@ def main() -> int:
     spent = report["spent_usd"]
     pct = report["pct_used"]
     print(f"  Requests        : {report['requests']}")
+    if report["requests_without_tokens"]:
+        gaps = ", ".join(
+            f"{row['model']}: {row['requests_without_tokens']}"
+            for row in report["models"]
+            if row["requests_without_tokens"]
+        )
+        print(
+            f"  No token counts : {report['requests_without_tokens']} "
+            f"({gaps}) -- billed as $0"
+        )
     if report["requests_without_pricing"]:
         print(
             f"  Without pricing : {report['requests_without_pricing']} "

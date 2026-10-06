@@ -131,7 +131,7 @@ from portkey_ai._vendor.openai.resources.chat.completions.completions import (
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-PROXY_VERSION = "1.7.0"
+PROXY_VERSION = "1.7.1"
 
 # --------------------------------------------------------------------------- #
 # Environment / .env loading
@@ -1795,6 +1795,71 @@ def _track_usage(alias: str, usage_data: Any, stream: bool) -> None:
         logging.exception("usage tracking failed for model=%s", alias)
 
 
+def _merge_usage(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    """Fold one usage block into another, keeping the largest count per field.
+
+    Streams report usage more than once, and `*_tokens_details` sub-objects are
+    merged the same way. Max (rather than last or first) is what survives both
+    shapes seen in the wild: a zero-filled placeholder followed by the real
+    cumulative counts, or partial counts that grow until the final frame.
+    """
+    for key, value in src.items():
+        current = dst.get(key)
+        if isinstance(value, dict):
+            if isinstance(current, dict):
+                _merge_usage(current, value)
+            else:
+                dst[key] = dict(value)
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            dst.setdefault(key, value)
+            continue
+        if isinstance(current, bool) or not isinstance(current, (int, float)):
+            dst[key] = value
+            continue
+        dst[key] = max(current, value)
+    return dst
+
+
+class _StreamUsageTracker:
+    """Accumulate the usage blocks of one stream, then record them once.
+
+    Providers disagree about *when* token counts appear:
+
+      - chat completions streams send a single usage chunk at the end
+        (`usage: null` on every earlier chunk, dropped by to_json_dict);
+      - the Responses API reports `usage: null` until `response.completed`;
+      - Azure-hosted Anthropic deployments (claude-opus-5-5) open the stream
+        with a **zero-filled** usage object on `response.created` and
+        `response.in_progress`, and only fill it in on `response.completed`.
+
+    Recording the first block that merely *exists* therefore logged 0 tokens
+    for every streaming claude request (verified live 2026-10-06). So every
+    block is merged field-wise and recorded once the stream is done.
+    """
+
+    def __init__(self, alias: str) -> None:
+        self.alias = alias
+        self.usage: Dict[str, Any] = {}
+        self._recorded = False
+
+    def observe(self, data: Dict[str, Any]) -> None:
+        """Absorb the usage block carried by one chunk / event, if any."""
+        usage = data.get("usage")
+        if not isinstance(usage, dict) or not usage:
+            nested = data.get("response")  # Responses stream events nest it
+            usage = nested.get("usage") if isinstance(nested, dict) else None
+        if isinstance(usage, dict) and usage:
+            _merge_usage(self.usage, usage)
+
+    def flush(self) -> None:
+        """Record the accumulated counts; no-op if the stream carried none."""
+        if self._recorded or not self.usage:
+            return
+        self._recorded = True
+        _track_usage(self.alias, self.usage, stream=True)
+
+
 # --------------------------------------------------------------------------- #
 # Portkey clients (one per API key, cached)
 # --------------------------------------------------------------------------- #
@@ -2041,7 +2106,7 @@ def _sse_stream(
     first with the tools+reasoning conflict (before any chunk was sent).
     """
     yielded_any = False
-    recorded_usage = False
+    usage_tracker = _StreamUsageTracker(alias)
     try:
         stream = client.chat.completions.create(
             model=upstream, stream=True, **attempts[0]
@@ -2050,13 +2115,7 @@ def _sse_stream(
             yielded_any = True
             data = to_json_dict(chunk)
             data["model"] = alias  # report the name the client asked for
-            if (
-                not recorded_usage
-                and isinstance(data.get("usage"), dict)
-                and data["usage"]
-            ):
-                recorded_usage = True
-                _track_usage(alias, data["usage"], stream=True)
+            usage_tracker.observe(data)
             yield sse_frame(data)
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
         status, message, err_type, code, param = _exception_details(exc)
@@ -2079,6 +2138,10 @@ def _sse_stream(
         yield sse_frame(
             {"error": _error_payload(message, err_type, code, param)["error"]}
         )
+    finally:
+        # Once (and only once) the stream is over: by now the final usage
+        # chunk has been folded into the tracker.
+        usage_tracker.flush()
     yield "data: [DONE]\n\n"
 
 
@@ -2111,20 +2174,12 @@ def _sse_bridged_stream(
     deltas, finish_reason, optional usage, then `data: [DONE]`.
     """
     translator = _ResponsesToChatSSE(alias)
-    recorded_usage = False
+    usage_tracker = _StreamUsageTracker(alias)
     try:
         stream = client.responses.create(model=upstream, stream=True, **kwargs)
         for event in stream:
             data = to_json_dict(event)
-            if not recorded_usage:
-                usage: Any = data.get("usage")
-                if not isinstance(usage, dict) or not usage:
-                    nested = data.get("response")
-                    if isinstance(nested, dict):
-                        usage = nested.get("usage")
-                if isinstance(usage, dict) and usage:
-                    recorded_usage = True
-                    _track_usage(alias, usage, stream=True)
+            usage_tracker.observe(data)
             for frame in translator.consume(data):
                 yield frame
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
@@ -2140,6 +2195,8 @@ def _sse_bridged_stream(
         )
         yield "data: [DONE]\n\n"
         return
+    finally:
+        usage_tracker.flush()
     for frame in translator.finish():
         yield frame
 
@@ -2379,20 +2436,12 @@ def _sse_responses_stream(
     There is no tools+reasoning conflict on this endpoint, so a single request
     variant is used (no _tools_reasoning_plan retry ladder).
     """
-    recorded_usage = False
+    usage_tracker = _StreamUsageTracker(alias)
     try:
         stream = client.responses.create(model=upstream, stream=True, **kwargs)
         for event in stream:
             data = _rewrite_response_models(to_json_dict(event), alias)
-            if not recorded_usage:
-                usage: Any = data.get("usage")
-                if not isinstance(usage, dict) or not usage:
-                    nested = data.get("response")
-                    if isinstance(nested, dict):
-                        usage = nested.get("usage")
-                if isinstance(usage, dict) and usage:
-                    recorded_usage = True
-                    _track_usage(alias, usage, stream=True)
+            usage_tracker.observe(data)
             yield sse_event_frame(data)
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
         status, message, err_type, code, param = _exception_details(exc)
@@ -2410,6 +2459,8 @@ def _sse_responses_stream(
                 "param": param,
             }
         )
+    finally:
+        usage_tracker.flush()
 
 
 def _sse_nrp_responses_stream(
@@ -2425,6 +2476,7 @@ def _sse_nrp_responses_stream(
     (carrying usage) and never sends `data: [DONE]`.
     """
     translator = _ChatToResponsesSSE(alias, upstream)
+    usage_tracker = _StreamUsageTracker(alias)
     for frame in translator.start_events():
         yield frame
     kwargs = _nrp_chat_kwargs(client, kwargs)
@@ -2434,6 +2486,7 @@ def _sse_nrp_responses_stream(
         )
         for chunk in stream:
             data = to_json_dict(chunk)
+            usage_tracker.observe(data)
             for frame in translator.consume(data):
                 yield frame
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
@@ -2446,6 +2499,8 @@ def _sse_nrp_responses_stream(
             {"type": "error", "message": message, "code": code, "param": param}
         )
         return
+    finally:
+        usage_tracker.flush()
     for frame in translator.finish():
         yield frame
 

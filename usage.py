@@ -241,6 +241,21 @@ def extract_tokens(usage: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+def has_tokens(tokens: Dict[str, int]) -> bool:
+    """Whether a normalized usage block carries any real counts.
+
+    An upstream can send a well-formed usage object full of zeros (Azure-hosted
+    Anthropic does this on its `response.created` / `response.in_progress`
+    events), so a record with no counts means the request was billed at $0 on
+    paper -- flag it instead of letting it look like free traffic.
+    """
+    return bool(
+        tokens.get("prompt_tokens")
+        or tokens.get("completion_tokens")
+        or tokens.get("total_tokens")
+    )
+
+
 def compute_cost(rates: Dict[str, float], tokens: Dict[str, int]) -> float:
     """USD cost for one call: plain input + cache-write + cache-read + output.
 
@@ -346,10 +361,20 @@ def record(
     Cost is None (with a log warning) when the model has no known pricing.
     pricing_model overrides the catalog name used for the price lookup
     (some upstream deployment names differ from their pricing API names).
+    A usage block that carried no counts is still recorded -- with
+    tokens_reported=False -- so the request shows up in reports as a gap
+    rather than as free traffic.
     """
     if not USAGE_TRACKING or not isinstance(usage, dict) or not usage:
         return None
     tokens = extract_tokens(usage)
+    reported = has_tokens(tokens)
+    if not reported:
+        log.warning(
+            "usage: %s carried a usage block with no token counts; "
+            "recorded as $0 (see _StreamUsageTracker in proxy.py)",
+            alias,
+        )
     priced_as = pricing_model or upstream
     rates: Optional[Dict[str, float]] = None
     cost: Optional[float] = None
@@ -370,6 +395,7 @@ def record(
         "pricing_model": priced_as,
         "stream": bool(stream),
         **tokens,
+        "tokens_reported": reported,
         "rates": rates or None,
         "cost_usd": cost,
     }
@@ -394,8 +420,29 @@ def record(
 # --------------------------------------------------------------------------- #
 
 
+def _carried_no_tokens(rec: Dict[str, Any]) -> bool:
+    """True when a logged request captured no token counts.
+
+    Records written before the tokens_reported field exists are judged by their
+    counters: a usage block was required to log a line at all, so an all-zero
+    line means the proxy never saw real counts (the zero-filled placeholder bug
+    this field was added to detect).
+    """
+    if "tokens_reported" in rec:
+        return rec.get("tokens_reported") is False
+    return not any(
+        _to_int(rec.get(field))
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens")
+    )
+
+
 def monthly_report(month: Optional[str] = None) -> Dict[str, Any]:
-    """Aggregated usage & spend for one calendar month."""
+    """Aggregated usage & spend for one calendar month.
+
+    ``requests_without_tokens`` counts records whose usage block carried no
+    counts (billing-blind requests); ``requests_without_pricing`` counts
+    records whose model had no catalog price.
+    """
     month = month or current_month()
     if not _MONTH_RE.match(month):
         raise ValueError(f"invalid month {month!r}; expected YYYY-MM")
@@ -403,6 +450,7 @@ def monthly_report(month: Optional[str] = None) -> Dict[str, Any]:
     per_model: Dict[str, Dict[str, Any]] = {}
     spent = 0.0
     without_pricing = 0
+    without_tokens = 0
     for rec in records:
         name = str(rec.get("model") or "unknown")
         row = per_model.setdefault(
@@ -419,9 +467,13 @@ def monthly_report(month: Optional[str] = None) -> Dict[str, Any]:
                 "total_tokens": 0,
                 "cost_usd": 0.0,
                 "requests_without_pricing": 0,
+                "requests_without_tokens": 0,
             },
         )
         row["requests"] += 1
+        if _carried_no_tokens(rec):
+            row["requests_without_tokens"] += 1
+            without_tokens += 1
         for field in (
             "prompt_tokens",
             "cached_tokens",
@@ -449,6 +501,7 @@ def monthly_report(month: Optional[str] = None) -> Dict[str, Any]:
         "over_budget": spent > budget if budget else None,
         "requests": len(records),
         "requests_without_pricing": without_pricing,
+        "requests_without_tokens": without_tokens,
         "models": sorted(
             per_model.values(), key=lambda r: (-r["cost_usd"], r["model"])
         ),

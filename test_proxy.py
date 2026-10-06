@@ -1060,8 +1060,8 @@ def main() -> int:
             str(cap["body"].get("reasoning")),
         )
 
-        # Streaming: typed events, text reassembles, usage arrives once, and
-        # there is no chat-style [DONE] sentinel.
+        # Streaming: typed events, text reassembles, real counts arrive only on
+        # response.completed, and there is no chat-style [DONE] sentinel.
         r = client.post("/v1/responses", json={**resp_body, "stream": True})
         check(
             "responses stream content type",
@@ -1102,10 +1102,26 @@ def main() -> int:
             if isinstance(f.get("usage"), dict)
             or isinstance((f.get("response") or {}).get("usage"), dict)
         ]
+        # The azure-ai shape puts a zero-filled usage block on the opening
+        # events; only response.completed may carry real counts.
+        nonzero = [
+            f
+            for f in usage_frames
+            if (f["response"]["usage"] if f.get("response") else f["usage"]).get(
+                "input_tokens"
+            )
+        ]
         check(
-            "responses stream carries usage exactly once",
-            len(usage_frames) == 1
-            and usage_frames[0]["response"]["usage"].get("input_tokens") == 12,
+            "responses stream: only response.completed carries counts",
+            len(nonzero) == 1
+            and nonzero[0]["type"] == "response.completed"
+            and nonzero[0]["response"]["usage"].get("input_tokens") == 12,
+            str([(f.get("type"), (f.get("response") or {}).get("usage")) for f in usage_frames]),
+        )
+        check(
+            "responses stream: opening events carry a zero usage placeholder",
+            [f.get("type") for f in usage_frames if f not in nonzero]
+            == ["response.created", "response.in_progress"],
             str([f.get("type") for f in usage_frames]),
         )
         cap = json.loads(CAPTURE.read_text())
@@ -1683,6 +1699,98 @@ def main() -> int:
             "openai/upstream-sol" in cache
             and (cache.get("anthropic/upstream-fable") or {}).get("rates") == {},
             str(sorted(cache)),
+        )
+
+        # Regression (2026-10-06): the azure-ai Anthropic deployment sends a
+        # zero-filled usage object on response.created / response.in_progress,
+        # and the real counts only on response.completed. Latching the first
+        # block recorded 117 claude-opus-5-5 requests as 0 tokens / $0.00.
+        # The mock now mirrors that shape, so a streaming /v1/responses request
+        # must log the final counts exactly once.
+        before_sol = len([x for x in usage_records() if x["model"] == "gpt-5.6-sol"])
+        r = client3.post(
+            "/v1/responses",
+            json={"model": "gpt-5.6-sol", "input": "Hi", "stream": True},
+        )
+        check("usage: responses stream ok", r.status_code == 200, r.text[:200])
+        sol = [x for x in usage_records() if x["model"] == "gpt-5.6-sol"]
+        mock_sol_stream = (12 * 0.0004 + 8 * 0.002) / 100
+        check(
+            "usage: responses stream logs one record with the final counts",
+            len(sol) == before_sol + 1
+            and sol[-1]["stream"] is True
+            and sol[-1]["prompt_tokens"] == 12
+            and sol[-1]["completion_tokens"] == 8
+            and sol[-1]["total_tokens"] == 20
+            and sol[-1]["tokens_reported"] is True
+            and sol[-1]["cost_usd"] is not None
+            and abs(sol[-1]["cost_usd"] - mock_sol_stream) < 1e-9,
+            str(sol[-1] if sol else None),
+        )
+
+        # The other upstream shape (OpenAI sends `usage: null` on the opening
+        # events) must track identically.
+        r = client3.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.6-terra",
+                "input": "Hi",
+                "stream": True,
+                "mock_usage_placeholder": False,
+            },
+        )
+        terra = [x for x in usage_records() if x["model"] == "gpt-5.6-terra"]
+        check(
+            "usage: responses stream with null placeholders still tracked",
+            r.status_code == 200
+            and len(terra) == 2
+            and terra[-1]["prompt_tokens"] == 12
+            and terra[-1]["completion_tokens"] == 8
+            and terra[-1]["cost_usd"] is not None,
+            str(terra[-1] if terra else None),
+        )
+
+        # A chat request bridged via /v1/responses (TOOLS_VIA_RESPONSES) is the
+        # same zero-placeholder stream, translated back into chat SSE.
+        r = client3.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-6-astra",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Get the weather",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "mock_tool_call": {"name": "get_weather", "arguments": '{"city":"Paris"}'},
+            },
+        )
+        astra = [x for x in usage_records() if x["model"] == "gpt-6-astra"]
+        check(
+            "usage: bridged chat stream tracked with final counts",
+            r.status_code == 200
+            and len(astra) == 2
+            and astra[-1]["stream"] is True
+            and astra[-1]["prompt_tokens"] == 12
+            and astra[-1]["completion_tokens"] == 8,
+            str(astra[-1] if astra else None),
+        )
+        rep = client3.get("/v1/usage").json()
+        check(
+            "usage: aggregate still counts every tracked request",
+            rep.get("requests") == 11,
+            str(rep.get("requests")),
+        )
+        check(
+            "usage: no tracked request was logged without token counts",
+            rep.get("requests_without_tokens") == 0,
+            str(rep.get("requests_without_tokens")),
         )
 
         # ------------------------------------------------------------ #
