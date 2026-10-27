@@ -239,15 +239,81 @@ def main() -> int:
             "x-portkey-request-timeout" not in cap["headers"],
             str({k: v for k, v in cap["headers"].items() if "timeout" in k}),
         )
+        # gpt models reject sampling params upstream, so the proxy drops them
+        # (clients like VSCode Copilot send temperature unconditionally).
         check(
-            "temperature forwarded",
-            cap["body"].get("temperature") == 0.7,
+            "temperature dropped for gpt models",
+            "temperature" not in cap["body"],
             str(cap["body"]),
         )
         check(
             "tools forwarded",
             cap["body"].get("tools") == req_body["tools"],
             str(cap["body"].get("tools")),
+        )
+
+        # Sampling strip + max_tokens rename, end to end.
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-6.1-sol",
+                "messages": [{"role": "user", "content": "Hi there"}],
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "frequency_penalty": 0.1,
+                "presence_penalty": 0.1,
+                "stop": ["\n\n"],
+                "max_tokens": 128,
+                "seed": 42,
+            },
+        )
+        check("gpt with sampling params -> 200", r.status_code == 200, r.text)
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "gpt: temperature/top_p/penalties/stop dropped",
+            all(
+                k not in cap["body"]
+                for k in (
+                    "temperature",
+                    "top_p",
+                    "frequency_penalty",
+                    "presence_penalty",
+                    "stop",
+                )
+            ),
+            str(cap["body"]),
+        )
+        check(
+            "gpt: max_tokens renamed to max_completion_tokens",
+            cap["body"].get("max_completion_tokens") == 128
+            and "max_tokens" not in cap["body"],
+            str(cap["body"]),
+        )
+        check(
+            "gpt: accepted params (seed) still forwarded",
+            cap["body"].get("seed") == 42,
+            str(cap["body"]),
+        )
+
+        # Sampling-capable models keep client values untouched.
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "claude-opus-5-5",
+                "messages": [{"role": "user", "content": "Hi there"}],
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "max_tokens": 128,
+            },
+        )
+        check("claude with sampling params -> 200", r.status_code == 200, r.text)
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "claude: sampling params forwarded untouched",
+            cap["body"].get("temperature") == 0.7
+            and cap["body"].get("top_p") == 0.9
+            and cap["body"].get("max_tokens") == 128,
+            str(cap["body"]),
         )
 
         # 2b. reasoning params + function tools (GPT-5.6 restriction) -----
@@ -954,6 +1020,44 @@ def main() -> int:
         r = client.post("/responses", json=resp_body)
         check("bare /responses also works", r.status_code == 200, r.text)
 
+        # gpt models refuse temperature/top_p on /v1/responses too; the proxy
+        # drops them instead of forwarding the upstream 400.
+        r = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-6.1-sol",
+                "input": "Hi there",
+                "temperature": 0.2,
+                "top_p": 0.9,
+            },
+        )
+        check(
+            "responses: gpt with sampling params -> 200", r.status_code == 200, r.text
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "responses: temperature/top_p dropped for gpt models",
+            "temperature" not in cap["body"] and "top_p" not in cap["body"],
+            str(cap["body"]),
+        )
+        r = client.post(
+            "/v1/responses",
+            json={
+                "model": "claude-opus-5-5",
+                "input": "Hi there",
+                "temperature": 0.7,
+            },
+        )
+        check(
+            "responses: claude with temperature -> 200", r.status_code == 200, r.text
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "responses: temperature forwarded for claude",
+            cap["body"].get("temperature") == 0.7,
+            str(cap["body"]),
+        )
+
         # A flat reasoning_effort (chat-completions style) is normalised into
         # the nested shape the Responses API reads.
         r = client.post(
@@ -1359,13 +1463,15 @@ def main() -> int:
                 "tools": req_body["tools"],
                 "max_tokens": 128,
                 "frequency_penalty": 0.5,
+                "temperature": 0.5,
             },
         )
         cap = json.loads(CAPTURE.read_text())
         check(
-            "bridge: max_tokens renamed, chat-only params dropped",
+            "bridge: max_tokens renamed, sampling/chat-only params dropped",
             cap["body"].get("max_output_tokens") == 128
             and "frequency_penalty" not in cap["body"]
+            and "temperature" not in cap["body"]
             and "max_tokens" not in cap["body"],
             str(cap["body"]),
         )

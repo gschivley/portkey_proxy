@@ -131,7 +131,7 @@ from portkey_ai._vendor.openai.resources.chat.completions.completions import (
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-PROXY_VERSION = "1.7.0"
+PROXY_VERSION = "1.8.0"
 
 # --------------------------------------------------------------------------- #
 # Environment / .env loading
@@ -250,6 +250,9 @@ if TOOLS_VIA_RESPONSES not in ("auto", "always", "never"):
 #   tools_conflict True when the upstream rejects tools + reasoning together
 #   tools_on_chat  False when NO chat-completions request shape accepts
 #                    function tools at all, so tools must go via /v1/responses
+#   sampling       False when the upstream rejects sampling knobs outright
+#                    (temperature/top_p/...); those params are dropped and
+#                    max_tokens is renamed to max_completion_tokens
 
 REASONING_PROFILES: Dict[str, Dict[str, Any]] = {
     # Rejects tools + reasoning in /v1/chat/completions (not on /v1/responses)
@@ -289,12 +292,18 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-5.6",
         "provider": "openai",
+        # Every gpt deployment rejects sampling knobs outright (only the
+        # default temperature is accepted, top_p/stop/penalties 400, and
+        # max_tokens must be spelled max_completion_tokens) — see
+        # CHAT_SAMPLING_DROPS. Flagged so they are dropped, not 400s.
+        "sampling": False,
     },
     "gpt-5.6-terra": {
         "upstream": os.environ.get("GPT56_TERRA_UPSTREAM_MODEL", "gpt-5.6-terra"),
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-5.6",
         "provider": "openai",
+        "sampling": False,
     },
     # Named gpt-6 but behaves like the GPT-5.6 family (verified live 2026-10-02):
     # it accepts reasoning_effort="none" (astra/6.1-sol reject it) and takes
@@ -306,6 +315,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-5.6",
         "provider": "openai",
+        "sampling": False,
     },
     "gpt-6-astra": {
         "upstream": os.environ.get("GPT6_ASTRA_UPSTREAM_MODEL", "gpt-6-astra"),
@@ -313,6 +323,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "reasoning": "gpt-6",
         "efforts_env": "GPT6_ASTRA_REASONING_EFFORTS",
         "provider": "openai",
+        "sampling": False,
     },
     "gpt-6.1-sol": {
         "upstream": os.environ.get("GPT6_SOL_UPSTREAM_MODEL", "gpt-6.1-sol"),
@@ -320,6 +331,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "reasoning": "gpt-6",
         "efforts_env": "GPT6_ASTRA_REASONING_EFFORTS",
         "provider": "openai",
+        "sampling": False,
         # The pricing catalog lists this deployment as "gpt-6-sol"; looking it
         # up under the request name 404s and the call is logged without a cost.
         "pricing_model": os.environ.get("GPT6_SOL_PRICING_MODEL", "gpt-6-sol"),
@@ -539,6 +551,74 @@ def _reasoning_desc(kwargs: Dict[str, Any]) -> str:
             return f"reasoning.effort={reasoning['effort']!r}"
         return "reasoning(no effort)"
     return "no reasoning params"
+
+
+# --------------------------------------------------------------------------- #
+# Sampling parameter handling (per model)
+# --------------------------------------------------------------------------- #
+# The OpenAI reasoning deployments behind every gpt-* alias reject requests
+# that try to pin sampling knobs (verified live 2026-10-27): on chat
+# completions temperature only accepts its default (1), top_p /
+# frequency_penalty / presence_penalty / stop are refused outright, and
+# max_tokens must be spelled max_completion_tokens (top_k and seed are
+# accepted). On /v1/responses the same models refuse temperature and top_p
+# but silently ignore the rest. Clients like VSCode Copilot send temperature
+# unconditionally, so models flagged "sampling": False in MODEL_REGISTRY get
+# the rejected names dropped — and max_tokens renamed — instead of an
+# upstream 400. Claude, Gemini and NRP models keep client values untouched.
+
+CHAT_SAMPLING_DROPS: Tuple[str, ...] = (
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "stop",
+)
+RESPONSES_SAMPLING_DROPS: Tuple[str, ...] = ("temperature", "top_p")
+
+
+def _sampling_supported(alias: str) -> bool:
+    """False for registry entries flagged "sampling": False."""
+    return bool(MODEL_REGISTRY.get(alias, {}).get("sampling", True))
+
+
+def _drop_unsupported_sampling(
+    alias: str, body: Dict[str, Any], drops: Tuple[str, ...]
+) -> List[str]:
+    """Remove sampling params the model's upstream rejects. Mutates `body`.
+
+    Returns the names that were present (and are now gone).
+    """
+    if _sampling_supported(alias):
+        return []
+    dropped = [key for key in drops if key in body]
+    for key in dropped:
+        del body[key]
+    return dropped
+
+
+def _normalize_chat_sampling(alias: str, body: Dict[str, Any]) -> None:
+    """Adapt a chat-completions body for a model without sampling support.
+
+    Drops the names the upstream rejects and renames max_tokens, so clients
+    that always send temperature (VSCode Copilot) get one working request
+    instead of a 400. No-op for models with sampling support.
+    """
+    dropped = _drop_unsupported_sampling(alias, body, CHAT_SAMPLING_DROPS)
+    if not _sampling_supported(alias):
+        max_tokens = body.pop("max_tokens", None)
+        if max_tokens is not None:
+            if "max_completion_tokens" in body:
+                dropped.append("max_tokens (kept max_completion_tokens)")
+            else:
+                body["max_completion_tokens"] = max_tokens
+                dropped.append("max_tokens -> max_completion_tokens")
+    if dropped:
+        logging.info(
+            "model=%s: sampling not supported upstream, adjusted: %s",
+            alias,
+            ", ".join(dropped),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -2150,8 +2230,13 @@ async def chat_completions(request: Request):
     client, alias, upstream, body = await _validated_request(request)
     stream = bool(body.get("stream", False))
 
-    # Forward all remaining parameters untouched (temperature, max_tokens,
-    # tools, tool_choice, top_p, stop, seed, response_format, ...).
+    # Sampling knobs the gpt deployments reject are dropped / renamed in
+    # place, so both the direct chat call and the responses bridge below
+    # send only what the upstream accepts.
+    _normalize_chat_sampling(alias, body)
+
+    # Forward all remaining parameters untouched (tools, tool_choice, top_k,
+    # seed, response_format, ...).
     kwargs = {k: v for k, v in body.items() if k not in ("model", "stream")}
     if stream and INCLUDE_STREAM_USAGE:
         kwargs.setdefault("stream_options", {"include_usage": True})
@@ -2463,6 +2548,16 @@ async def responses_create(request: Request):
         )
     client, alias, upstream, body = await _validated_request(request)
     stream = bool(body.get("stream", False))
+
+    dropped_sampling = _drop_unsupported_sampling(
+        alias, body, RESPONSES_SAMPLING_DROPS
+    )
+    if dropped_sampling:
+        logging.info(
+            "model=%s: dropped sampling params unsupported on responses: %s",
+            alias,
+            ", ".join(dropped_sampling),
+        )
 
     if MODEL_REGISTRY[alias].get("responses_via_chat"):
         # The upstream has no working Responses API (NRP's /v1/responses is a

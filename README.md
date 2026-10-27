@@ -71,7 +71,11 @@ Everything requested is forwarded: parameters (`temperature`, `max_tokens`,
 `top_p`, `tools`, `tool_choice`, `stop`, `seed`, `response_format`, …),
 model names, errors (translated to OpenAI error JSON with the upstream status code),
 and usage metadata (including in the final streaming chunk when
-`INCLUDE_STREAM_USAGE=1`).
+`INCLUDE_STREAM_USAGE=1`). One exception: the `gpt-*` deployments reject
+sampling knobs outright, so for those models the proxy drops
+`temperature`/`top_p`/`frequency_penalty`/`presence_penalty`/`stop` and
+renames `max_tokens` to `max_completion_tokens` instead of failing with a 400
+(see [Troubleshooting](#troubleshooting)).
 
 **Authentication**: the API key you enter in the Copilot app's model provider
 settings is sent with every request as `Authorization: Bearer <key>`; the
@@ -360,6 +364,21 @@ GEMINI38_FLASH_REASONING_EFFORTS=minimal,low,medium,high
 ```
 
 The first configured non-`none` value becomes the fallback for rejected inputs.
+
+**"Unsupported parameter: 'temperature' is not supported with this model"**
+
+The `gpt-*` deployments refuse requests that pin sampling knobs (verified
+live 2026-10-27): on `/v1/chat/completions` `temperature` only accepts its
+default (`1`), `top_p` / `frequency_penalty` / `presence_penalty` / `stop`
+are rejected outright, and `max_tokens` must be spelled
+`max_completion_tokens` (`top_k` and `seed` are accepted). On
+`/v1/responses` the same models refuse only `temperature` and `top_p` and
+ignore the rest. VSCode Copilot sends `temperature` unconditionally, so
+**v1.8.0 drops the rejected names — and renames `max_tokens` — automatically**
+for the models flagged `sampling: False` in `MODEL_REGISTRY` (every `gpt-*`
+alias). Claude, Gemini and NRP models forward sampling values untouched.
+Both routes are covered, including the tools-via-Responses bridge; the log
+line reads `sampling not supported upstream, adjusted: ...`.
 
 **`gpt-6-astra` rejects function tools on `/v1/chat/completions` entirely**
 
