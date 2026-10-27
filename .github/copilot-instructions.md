@@ -19,7 +19,7 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the full integration test suite (212 checks; boots a mock upstream + the real proxy)
+# Run the full integration test suite (222 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -80,7 +80,9 @@ pip install -r requirements.txt
    `x-portkey-api-key` → optional `PORTKEY_API_KEY`/`AI_SANDBOX_KEY` fallback.
    No key → 401.
 4. All other body params are forwarded untouched; the alias is rewritten to the
-   registry's `upstream` model.
+   registry's `upstream` model. Exception: models flagged `sampling: False`
+   (every `gpt-*` alias) get sampling knobs dropped / renamed first — see the
+   sampling convention below.
 5. The `portkey_ai` SDK call is made with a cached client (one per API key,
    max 16): `client.chat.completions.create` or `client.responses.create`.
 6. Responses are converted back to OpenAI JSON/SSE; `model` is rewritten to the
@@ -170,6 +172,17 @@ pip install -r requirements.txt
   - When adding a model, pick a profile (or add one) and update
     `REASONING_PROFILES`/`MODEL_REGISTRY`; the tests in `test_proxy.py` cover all
     three behaviors.
+- **Sampling is per-model (`sampling: False`)**: every `gpt-*` deployment
+  rejects sampling knobs (verified live 2026-10-27): on chat completions
+  `temperature` only accepts its default, `top_p`/`frequency_penalty`/
+  `presence_penalty`/`stop` are refused, and `max_tokens` must be spelled
+  `max_completion_tokens`; on `/v1/responses` only `temperature`/`top_p` are
+  refused. `_normalize_chat_sampling` (called in `chat_completions` before
+  kwargs are built, so it covers both the direct chat path and the
+  tools-via-Responses bridge) and `_drop_unsupported_sampling` with
+  `RESPONSES_SAMPLING_DROPS` (in `responses_create`) drop/rename them before
+  the call, so clients that always send `temperature` (VSCode Copilot) keep
+  working. Claude/Gemini/NRP forward values untouched.
 - **Errors are OpenAI-shaped**: `ApiError` + `_exception_details` map SDK
   exception class names (e.g. `RateLimitError` → 429) to
   `{"error": {message, type, param, code}}`. Streaming errors are emitted as SSE
@@ -203,4 +216,4 @@ pip install -r requirements.txt
   actually forwarded; it's gitignored and deleted at the end of the run.
 - Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log` (gitignored).
 - After changing proxy behavior, run `./.venv/bin/python test_proxy.py` and
-  confirm "ALL TESTS PASSED" (212 checks).
+  confirm "ALL TESTS PASSED" (222 checks).
