@@ -716,6 +716,101 @@ def main() -> int:
             str(cap["body"].get("reasoning_effort")),
         )
 
+        # Default reasoning_effort="medium" when client omits reasoning:
+        # 1) Chat completions without tools on gpt-5.6-sol -> reasoning_effort="medium"
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-5.6-sol",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "default reasoning: chat without tools injects reasoning_effort=medium",
+            r.status_code == 200 and cap["body"].get("reasoning_effort") == "medium",
+            str(cap["body"].get("reasoning_effort")),
+        )
+
+        # 2) Claude with tools and no reasoning -> reasoning_effort="medium"
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "claude-opus-5-5",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": req_body["tools"],
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "default reasoning: claude-opus-5-5 with tools defaults to medium",
+            r.status_code == 200 and cap["body"].get("reasoning_effort") == "medium",
+            str(cap["body"].get("reasoning_effort")),
+        )
+
+        # 3) Bridged chat -> responses (gpt-6-astra with tools and no reasoning)
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-6-astra",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "tools": req_body["tools"],
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "default reasoning: bridged chat->responses defaults reasoning.effort=medium",
+            r.status_code == 200
+            and (cap["body"].get("reasoning") or {}).get("effort") == "medium",
+            str(cap["body"].get("reasoning")),
+        )
+
+        # 4) Direct /v1/responses with no reasoning -> reasoning.effort="medium"
+        r = client.post(
+            "/v1/responses",
+            json={"model": "claude-opus-5-5", "input": "Hi"},
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "default reasoning: /v1/responses defaults reasoning.effort=medium",
+            r.status_code == 200
+            and (cap["body"].get("reasoning") or {}).get("effort") == "medium",
+            str(cap["body"].get("reasoning")),
+        )
+
+        for route, input_body in (
+            ("/v1/responses", {"input": "Hi"}),
+            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}]}),
+        ):
+            for malformed in ("high", True, False, 0, []):
+                r = client.post(
+                    route,
+                    json={"model": "claude-opus-5-5", **input_body, "reasoning": malformed},
+                )
+                error = r.json().get("error", {})
+                check(
+                    f"default reasoning: {route} rejects {malformed!r} with 400",
+                    r.status_code == 400
+                    and error.get("param") == "reasoning"
+                    and error.get("code") == "invalid_type",
+                    r.text,
+                )
+            for reasoning in (None, {"summary": "auto"}):
+                r = client.post(
+                    route,
+                    json={"model": "claude-opus-5-5", **input_body, "reasoning": reasoning},
+                )
+                cap = json.loads(CAPTURE.read_text())
+                expected = {**(reasoning or {}), "effort": "medium"}
+                actual = cap["body"].get("reasoning")
+                if route.endswith("chat/completions") and reasoning is None:
+                    actual = {"effort": cap["body"].get("reasoning_effort")}
+                check(
+                    f"default reasoning: {route} merges {reasoning!r}",
+                    r.status_code == 200 and actual == expected,
+                    str(cap["body"]),
+                )
+
         # 3. Streaming ----------------------------------------------------
         r = client.post("/v1/chat/completions", json={**req_body, "stream": True})
         frames = parse_sse(r.text)
@@ -842,6 +937,10 @@ def main() -> int:
                 # Vocabulary override: the proxy must honour configured values
                 # and pick its fallback from them (never 'none' for astra).
                 "GPT6_ASTRA_REASONING_EFFORTS": "minimal,medium,xhigh",
+                "DEFAULT_REASONING_EFFORT": "off",
+                "CLAUDE_OPUS_55_DEFAULT_REASONING_EFFORT": "low",
+                "CLAUDE_SONNET_55_DEFAULT_REASONING_EFFORT": "0",
+                "CLAUDE_FABLE_51_DEFAULT_REASONING_EFFORT": "none",
             }
         )
         proxy2_log = open(ROOT / "_proxy2.log", "w")
@@ -949,6 +1048,33 @@ def main() -> int:
             r.status_code == 200 and cap["body"].get("reasoning_effort") == "medium",
             str(cap["body"].get("reasoning_effort")),
         )
+
+        for alias, expected in (
+            ("gpt-5.6-sol", None),
+            ("claude-opus-5-5", "low"),
+            ("claude-sonnet-5-5", None),
+            ("claude-fable-5-1", "none"),
+        ):
+            for route, input_body in (
+                ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}]}),
+                ("/v1/responses", {"input": "Hi"}),
+            ):
+                r = client2.post(
+                    route,
+                    json={"model": alias, **input_body},
+                    headers={"Authorization": "Bearer app-test-key"},
+                )
+                cap = json.loads(CAPTURE.read_text())
+                actual = (
+                    cap["body"].get("reasoning_effort")
+                    if route.endswith("chat/completions")
+                    else (cap["body"].get("reasoning") or {}).get("effort")
+                )
+                check(
+                    f"default reasoning: {alias} {route} override -> {expected!r}",
+                    r.status_code == 200 and actual == expected,
+                    str(cap["body"]),
+                )
 
         # 7. Responses API (/v1/responses) --------------------------------
         # Responses-native request: nested reasoning, FLAT function tools.

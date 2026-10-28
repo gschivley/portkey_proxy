@@ -480,6 +480,19 @@ never captured — so spend for the affected period is understated.
 
 ## Configuration reference
 
+Portkey models default to `medium` when the client omits a reasoning effort.
+Explicit client efforts still take precedence (subject to the existing model
+compatibility rules). Set `DEFAULT_REASONING_EFFORT=off` or `0` to stop injecting
+defaults; `none` is an actual effort value, **not** a disable switch, and models
+that reject it will use their configured fallback.
+
+Per-model overrides use the same prefixes as upstream-model settings, for example
+`CLAUDE_OPUS_55_DEFAULT_REASONING_EFFORT=low` or
+`GPT56_SOL_DEFAULT_REASONING_EFFORT=off`. These override the global setting,
+including when the global default is disabled. Restart the proxy after changing
+configuration. NRP models are unaffected; GPT-5.6 chat tool calls retain the
+existing reasoning strip/retry behavior.
+
 | Variable | Default | Meaning |
 | ---------- | --------- | --------- |
 | `PORTKEY_API_KEY` | – (unset) | Optional fallback key for requests that send no API key; `AI_SANDBOX_KEY` also accepted |
@@ -496,6 +509,7 @@ never captured — so spend for the affected period is understated.
 | `QWEN3_UPSTREAM_MODEL` / `DEEPSEEK_V4_FLASH_UPSTREAM_MODEL` / `GLM5_UPSTREAM_MODEL` | alias name | Map an NRP alias to a different upstream model |
 | `GPT6_ASTRA_REASONING_EFFORTS` | `low,medium,high,xhigh` | Comma-separated `reasoning_effort` values the upstream accepts for `gpt-6-astra`; unsupported client values are rewritten to the first non-`none` entry |
 | `GEMINI38_FLASH_REASONING_EFFORTS` / `GEMINI4_ARGON_REASONING_EFFORTS` / `CLAUDE_OPUS_55_REASONING_EFFORTS` / `CLAUDE_SONNET_55_REASONING_EFFORTS` / `CLAUDE_FABLE_51_REASONING_EFFORTS` | – (unset) | Optional comma-separated `reasoning_effort` list for `gemini-3.8-flash`, `gemini-4-argon` or a Claude model; when unset, client values are forwarded untouched |
+| `DEFAULT_REASONING_EFFORT` / `<ALIAS>_DEFAULT_REASONING_EFFORT` | `medium` | Default reasoning effort injected for Portkey models when the client harness omits one (`reasoning_effort` on chat, `reasoning.effort` on Responses). Set to `off` or `0` to disable |
 | `USAGE_TRACKING` | `1` | Record token usage and dollar cost of every request to the JSONL usage log |
 | `USAGE_LOG_PATH` | `usage.jsonl` (next to `proxy.py`) | Append-only usage log; also read directly by `usage_report.py` |
 | `MONTHLY_BUDGET_USD` | `250` | Monthly budget used by `/v1/usage` reports and the proxy's budget warning logs |

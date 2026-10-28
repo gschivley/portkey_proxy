@@ -85,6 +85,10 @@ Configuration (local .env file next to this script, or environment):
                            comma-separated accepted reasoning_effort values
                            for those models (default: unset, so whatever
                            the client sends is forwarded untouched)
+    DEFAULT_REASONING_EFFORT   default reasoning effort injected for Portkey
+                           models when the client omits one (default: medium;
+                           set "off" or "0" to disable; overridable per
+                           model via <ALIAS>_DEFAULT_REASONING_EFFORT)
     GEMINI38_FLASH_PRICING_MODEL   pricing-catalog model name for
                            gemini-3.8-flash (default gemini-3.8-flash-gt-128k)
     GEMINI4_ARGON_PRICING_MODEL    pricing-catalog model name for
@@ -237,6 +241,24 @@ if TOOLS_VIA_RESPONSES not in ("auto", "always", "never"):
     )
     TOOLS_VIA_RESPONSES = "auto"
 
+_DISABLED_DEFAULT_EFFORTS = ("", "off", "false", "0", "unset")
+
+
+def _parse_default_effort(
+    raw: Optional[str], fallback: Optional[str] = "medium"
+) -> Optional[str]:
+    if raw is None:
+        return fallback
+    val = raw.strip().lower()
+    if val in _DISABLED_DEFAULT_EFFORTS:
+        return None
+    return val
+
+
+DEFAULT_REASONING_EFFORT = _parse_default_effort(
+    os.environ.get("DEFAULT_REASONING_EFFORT"), "medium"
+)
+
 # --------------------------------------------------------------------------- #
 # Model registry
 # --------------------------------------------------------------------------- #
@@ -295,6 +317,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "upstream": os.environ.get("GPT56_SOL_UPSTREAM_MODEL", "gpt-5.6-sol"),
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-5.6",
+        "default_effort": _parse_default_effort(
+            os.environ.get("GPT56_SOL_DEFAULT_REASONING_EFFORT"),
+            DEFAULT_REASONING_EFFORT,
+        ),
         "provider": "openai",
         # Every gpt deployment rejects sampling knobs outright (only the
         # default temperature is accepted, top_p/stop/penalties 400, and
@@ -306,6 +332,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "upstream": os.environ.get("GPT56_TERRA_UPSTREAM_MODEL", "gpt-5.6-terra"),
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-5.6",
+        "default_effort": _parse_default_effort(
+            os.environ.get("GPT56_TERRA_DEFAULT_REASONING_EFFORT"),
+            DEFAULT_REASONING_EFFORT,
+        ),
         "provider": "openai",
         "sampling": False,
     },
@@ -318,6 +348,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "upstream": os.environ.get("GPT6_LUNA_UPSTREAM_MODEL", "gpt-6-luna"),
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-5.6",
+        "default_effort": _parse_default_effort(
+            os.environ.get("GPT6_LUNA_DEFAULT_REASONING_EFFORT"),
+            DEFAULT_REASONING_EFFORT,
+        ),
         "provider": "openai",
         "sampling": False,
     },
@@ -326,6 +360,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-6",
         "efforts_env": "GPT6_ASTRA_REASONING_EFFORTS",
+        "default_effort": _parse_default_effort(
+            os.environ.get("GPT6_ASTRA_DEFAULT_REASONING_EFFORT"),
+            DEFAULT_REASONING_EFFORT,
+        ),
         "provider": "openai",
         "sampling": False,
     },
@@ -334,6 +372,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "gpt-6",
         "efforts_env": "GPT6_ASTRA_REASONING_EFFORTS",
+        "default_effort": _parse_default_effort(
+            os.environ.get("GPT6_SOL_DEFAULT_REASONING_EFFORT"),
+            DEFAULT_REASONING_EFFORT,
+        ),
         "provider": "openai",
         "sampling": False,
         # The pricing catalog lists this deployment as "gpt-6-sol"; looking it
@@ -345,6 +387,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "flexible",
         "efforts_env": "GEMINI38_FLASH_REASONING_EFFORTS",
+        "default_effort": _parse_default_effort(
+            os.environ.get("GEMINI38_FLASH_DEFAULT_REASONING_EFFORT"),
+            DEFAULT_REASONING_EFFORT,
+        ),
         "provider": "google",
         # The pricing catalog lists this model under a longer name.
         "pricing_model": os.environ.get(
@@ -356,6 +402,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "description": "Portkey/AI Sandbox model exposed to the Copilot app",
         "reasoning": "flexible",
         "efforts_env": "GEMINI4_ARGON_REASONING_EFFORTS",
+        "default_effort": _parse_default_effort(
+            os.environ.get("GEMINI4_ARGON_DEFAULT_REASONING_EFFORT"),
+            DEFAULT_REASONING_EFFORT,
+        ),
         "provider": "google",
         # Like gemini-3.8-flash, the pricing catalog only lists the -gt-128k name.
         "pricing_model": os.environ.get(
@@ -367,6 +417,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "description": "Anthropic Claude Opus 5.5 via the AI Sandbox",
         "reasoning": "flexible",
         "efforts_env": "CLAUDE_OPUS_55_REASONING_EFFORTS",
+        "default_effort": _parse_default_effort(
+            os.environ.get("CLAUDE_OPUS_55_DEFAULT_REASONING_EFFORT"),
+            DEFAULT_REASONING_EFFORT,
+        ),
         "provider": "anthropic",
     },
     "claude-sonnet-5-5": {
@@ -376,6 +430,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "description": "Anthropic Claude Sonnet 5.5 via the AI Sandbox",
         "reasoning": "flexible",
         "efforts_env": "CLAUDE_SONNET_55_REASONING_EFFORTS",
+        "default_effort": _parse_default_effort(
+            os.environ.get("CLAUDE_SONNET_55_DEFAULT_REASONING_EFFORT"),
+            DEFAULT_REASONING_EFFORT,
+        ),
         "provider": "anthropic",
     },
     "claude-fable-5-1": {
@@ -385,6 +443,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "description": "Anthropic Claude Fable 5.1 via the AI Sandbox",
         "reasoning": "flexible",
         "efforts_env": "CLAUDE_FABLE_51_REASONING_EFFORTS",
+        "default_effort": _parse_default_effort(
+            os.environ.get("CLAUDE_FABLE_51_DEFAULT_REASONING_EFFORT"),
+            DEFAULT_REASONING_EFFORT,
+        ),
         "provider": "anthropic",
     },
     # NRP gateway models. api_source routes them to NRP_BASE_URL with the
@@ -436,6 +498,7 @@ def reasoning_caps(alias: str) -> Dict[str, Any]:
     caps: Dict[str, Any] = {
         "efforts": list(profile["efforts"]) if profile["efforts"] else None,
         "fallback": profile["fallback"],
+        "default_effort": entry.get("default_effort"),
         "tools_conflict": bool(profile["tools_conflict"]),
         "tools_on_chat": bool(profile.get("tools_on_chat", True)),
     }
@@ -449,6 +512,38 @@ def reasoning_caps(alias: str) -> Dict[str, Any]:
 
 def _effort_supported(caps: Dict[str, Any], effort: str) -> bool:
     return caps["efforts"] is None or effort in caps["efforts"]
+
+
+def _has_reasoning_effort(payload: Dict[str, Any]) -> bool:
+    """True when the request already specifies a reasoning effort."""
+    if payload.get("reasoning_effort") is not None:
+        return True
+    reasoning = payload.get("reasoning")
+    return isinstance(reasoning, dict) and reasoning.get("effort") is not None
+
+
+def _apply_default_reasoning(
+    payload: Dict[str, Any], caps: Dict[str, Any], nested: bool = False
+) -> Optional[str]:
+    """Inject the model's default_effort in place when none was sent."""
+    default = caps.get("default_effort")
+    if not default or _has_reasoning_effort(payload):
+        return None
+    reasoning = payload.get("reasoning")
+    if reasoning is not None and not isinstance(reasoning, dict):
+        raise ApiError(
+            400,
+            "'reasoning' must be a JSON object or null.",
+            param="reasoning",
+            code="invalid_type",
+        )
+    if nested or isinstance(reasoning, dict):
+        reasoning = dict(reasoning or {})
+        reasoning["effort"] = default
+        payload["reasoning"] = reasoning
+    else:
+        payload["reasoning_effort"] = default
+    return default
 
 
 # --------------------------------------------------------------------------- #
@@ -812,6 +907,9 @@ def _responses_kwargs(
                 code="unsupported_input_shape",
             )
 
+    defaulted = _apply_default_reasoning(kwargs, caps, nested=True)
+    if defaulted:
+        notes.append(f"defaulted reasoning.effort={defaulted!r}")
     kwargs, rewrite = _sanitize_reasoning(kwargs, caps)
     if rewrite:
         notes.append(f"reasoning effort {rewrite}")
@@ -1026,6 +1124,9 @@ def _chat_to_responses_kwargs(
             notes.append(f"dropped {key}")
         else:
             kwargs[key] = value  # temperature, top_p, stop, user, metadata, ...
+    defaulted = _apply_default_reasoning(kwargs, caps, nested=True)
+    if defaulted:
+        notes.append(f"defaulted reasoning.effort={defaulted!r}")
     kwargs, rewrite = _sanitize_reasoning(kwargs, caps)
     if rewrite:
         notes.append(f"reasoning effort {rewrite}")
@@ -2314,10 +2415,19 @@ async def chat_completions(request: Request):
         kwargs.setdefault("stream_options", {"include_usage": True})
     kwargs = _nrp_chat_kwargs(client, kwargs)
 
-    # Per-model reasoning handling: rewrite effort values the model rejects
+    # Per-model reasoning handling: inject the model's default effort when
+    # the client omitted one, rewrite effort values the model rejects
     # (gpt-6-astra has no "none"), and build the ordered list of request
     # variants for models that reject tools + reasoning together (GPT-5.6).
     caps = reasoning_caps(alias)
+    defaulted = _apply_default_reasoning(body, caps, nested=False)
+    if defaulted:
+        _apply_default_reasoning(kwargs, caps, nested=False)
+        logging.info(
+            "model=%s: defaulted reasoning_effort=%r (none sent by client)",
+            alias,
+            defaulted,
+        )
     kwargs, rewrite = _sanitize_reasoning(kwargs, caps)
     if rewrite:
         logging.info(
