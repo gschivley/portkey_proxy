@@ -70,6 +70,7 @@ Configuration (local .env file next to this script, or environment):
     GPT6_SOL_UPSTREAM_MODEL      optional upstream model for gpt-6.1-sol
     GPT6_LUNA_UPSTREAM_MODEL     optional upstream model for gpt-6-luna
     GEMINI38_FLASH_UPSTREAM_MODEL  optional upstream model for gemini-3.8-flash
+    GEMINI4_ARGON_UPSTREAM_MODEL   optional upstream model for gemini-4-argon
     CLAUDE_OPUS_55_UPSTREAM_MODEL     optional upstream model for claude-opus-5-5
     CLAUDE_SONNET_55_UPSTREAM_MODEL   optional upstream model for claude-sonnet-5-5
     CLAUDE_FABLE_51_UPSTREAM_MODEL    optional upstream model for claude-fable-5-1
@@ -77,6 +78,7 @@ Configuration (local .env file next to this script, or environment):
                            upstream accepts for gpt-6-astra (default
                            low,medium,high,xhigh — 'none' is rejected there)
     GEMINI38_FLASH_REASONING_EFFORTS
+    GEMINI4_ARGON_REASONING_EFFORTS
     CLAUDE_OPUS_55_REASONING_EFFORTS
     CLAUDE_SONNET_55_REASONING_EFFORTS
     CLAUDE_FABLE_51_REASONING_EFFORTS
@@ -85,6 +87,8 @@ Configuration (local .env file next to this script, or environment):
                            the client sends is forwarded untouched)
     GEMINI38_FLASH_PRICING_MODEL   pricing-catalog model name for
                            gemini-3.8-flash (default gemini-3.8-flash-gt-128k)
+    GEMINI4_ARGON_PRICING_MODEL    pricing-catalog model name for
+                           gemini-4-argon (default gemini-4-argon-gt-128k)
     GPT6_SOL_PRICING_MODEL pricing-catalog model name for gpt-6.1-sol
                            (default gpt-6-sol — the catalog has no entry under
                            the deployment name)
@@ -345,6 +349,17 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         # The pricing catalog lists this model under a longer name.
         "pricing_model": os.environ.get(
             "GEMINI38_FLASH_PRICING_MODEL", "gemini-3.8-flash-gt-128k"
+        ),
+    },
+    "gemini-4-argon": {
+        "upstream": os.environ.get("GEMINI4_ARGON_UPSTREAM_MODEL", "gemini-4-argon"),
+        "description": "Portkey/AI Sandbox model exposed to the Copilot app",
+        "reasoning": "flexible",
+        "efforts_env": "GEMINI4_ARGON_REASONING_EFFORTS",
+        "provider": "google",
+        # Like gemini-3.8-flash, the pricing catalog only lists the -gt-128k name.
+        "pricing_model": os.environ.get(
+            "GEMINI4_ARGON_PRICING_MODEL", "gemini-4-argon-gt-128k"
         ),
     },
     "claude-opus-5-5": {

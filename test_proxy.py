@@ -169,6 +169,7 @@ def main() -> int:
             and "gpt-6-astra" in ids
             and "gpt-6.1-sol" in ids
             and "gemini-3.8-flash" in ids
+            and "gemini-4-argon" in ids
             and "claude-opus-5-5" in ids
             and "claude-sonnet-5-5" in ids
             and "claude-fable-5-1" in ids,
