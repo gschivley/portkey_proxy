@@ -19,7 +19,7 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the full integration test suite (222 checks; boots a mock upstream + the real proxy)
+# Run the full integration test suite (229 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -38,7 +38,9 @@ pip install -r requirements.txt
   Reads its config at import time (after `.env` loading). `PricingCache` fetches
   `GET {PRICING_BASE_URL}/pricing/<provider>/<model>` (public Portkey API) with a
   file-backed TTL cache and negative caching; `record()` appends one JSONL line per
-  call to `usage.jsonl` and emits budget-milestone warnings; `monthly_report()`
+  call to `usage.jsonl` (with `tokens_reported: false` when the usage block carried no
+  counts) and emits budget-milestone warnings; `monthly_report()` reports
+  `requests_without_tokens` alongside `requests_without_pricing`
   aggregates by model for a `YYYY-MM` bucket. Cost formula:
   `tokens * price / 100` — the API returns the per-token USD price scaled x100.
   Input is split three ways because `cached_tokens` and `cache_write_tokens` are
@@ -190,6 +192,16 @@ pip install -r requirements.txt
 - **Streaming**: `_sse_stream` re-emits SDK chunks as SSE; `data["model"]` is
   always rewritten to the alias; `INCLUDE_STREAM_USAGE=1` adds
   `stream_options.include_usage` so the final chunk carries usage.
+- **Never latch the first streaming `usage` block**: all four stream generators
+  (`_sse_stream`, `_sse_bridged_stream`, `_sse_responses_stream`,
+  `_sse_nrp_responses_stream`) feed every chunk through `_StreamUsageTracker`
+  (field-wise `_merge_usage`, recorded once in a `finally`). The azure-ai
+  Anthropic deployments send a **zero-filled** `usage` on
+  `response.created`/`response.in_progress` and real counts only on
+  `response.completed`; OpenAI sends `usage: null` there. Latching the first
+  block logged every streaming `claude-opus-5-5` request as 0 tokens / $0
+  (fixed in v1.8.1). `mock_upstream.py` emits the zero-filled placeholder by
+  default — pass `mock_usage_placeholder: false` for the `null` shape.
 - **`.env` loading**: `_load_env_files` reads `.env` from the script dir and cwd
   with `override=False` (existing env vars win). Config is read at import time —
   changing `.env` requires a restart.
@@ -216,4 +228,4 @@ pip install -r requirements.txt
   actually forwarded; it's gitignored and deleted at the end of the run.
 - Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log` (gitignored).
 - After changing proxy behavior, run `./.venv/bin/python test_proxy.py` and
-  confirm "ALL TESTS PASSED" (222 checks).
+  confirm "ALL TESTS PASSED" (229 checks).

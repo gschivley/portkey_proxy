@@ -375,6 +375,9 @@ async def responses(request: Request):
     # Test-only directive: answer with a function_call output item instead of a
     # message, so the chat<->responses bridge can be exercised end to end.
     tool_call = body.pop("mock_tool_call", None)
+    # Test-only directive: `false` opens the stream with `usage: null` instead
+    # of the zero-filled placeholder (see below).
+    usage_placeholder = body.pop("mock_usage_placeholder", None)
     _record(request, body)
     model = body.get("model", "unknown")
     now = int(time.time())
@@ -418,6 +421,22 @@ async def responses(request: Request):
     }
     if cached_tokens is not None:
         usage["input_tokens_details"] = {"cached_tokens": cached_tokens}
+
+    # Usage on the opening events differs by upstream family (verified live
+    # 2026-10-06): OpenAI deployments send `usage: null`, while the azure-ai
+    # (Anthropic) deployment sends a fully zero-filled usage object on
+    # response.created / response.in_progress and only reports real counts on
+    # response.completed. The zero-filled shape is the dangerous one -- a stream
+    # handler that records the first block it sees logs 0 tokens -- so it is the
+    # default here. Pass mock_usage_placeholder: false for the null shape.
+    zero_usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": 0},
+    }
+    placeholder = None if usage_placeholder is False else zero_usage
 
     if isinstance(tool_call, dict):
         name = tool_call.get("name", "get_weather")
@@ -477,7 +496,7 @@ async def responses(request: Request):
                 **response_obj,
                 "status": "in_progress",
                 "output": [],
-                "usage": None,
+                "usage": placeholder,
             }
 
         yield event({"type": "response.created", "response": in_progress()})

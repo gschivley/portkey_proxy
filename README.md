@@ -251,7 +251,7 @@ Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
 {"ts":"2026-09-16T09:51:02","month":"2026-09","model":"gpt-5.6-sol","upstream":"gpt-5.6-sol",
  "provider":"openai","pricing_model":"gpt-5.6-sol","stream":true,"prompt_tokens":12,
  "cached_tokens":4,"cache_write_tokens":0,"completion_tokens":8,"reasoning_tokens":0,
- "total_tokens":20,
+ "total_tokens":20,"tokens_reported":true,
  "rates":{"input":0.0004,"output":0.002,"cache_read_input":4e-05,"cache_write_input":0.0005},
  "cost_usd":0.0001936}
 ```
@@ -295,6 +295,20 @@ Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
   A dash means the catalog has no rate for that cell, so it falls back to the
   plain input rate. Override a mapping with `<ALIAS>_PRICING_MODEL` (e.g.
   `GPT6_SOL_PRICING_MODEL`) when the catalog renames a deployment.
+- **Streaming usage** arrives differently per upstream, so the proxy watches
+  *every* `usage` block in a stream and keeps the highest value seen per field
+  (`_StreamUsageTracker`), then logs one record when the stream ends. This
+  matters because the Azure-hosted Anthropic deployments send a **zero-filled**
+  `usage` object on `response.created` / `response.in_progress` and only report
+  real counts on `response.completed` (OpenAI's deployments send `usage: null`
+  there instead) — latching the first block logged every `claude-opus-5-5`
+  request as 0 tokens / $0. Flushing in a `finally` also means an aborted
+  stream still bills whatever counts were reported.
+- **Records without counts.** Every record carries `tokens_reported`. If a
+  response yields a `usage` block that is all zeros, the request is still
+  logged (with a proxy warning) and reports show it as
+  `No token counts : N -- billed as $0` instead of hiding it, so a future
+  upstream change is visible rather than silently free.
 - **Budget warnings** are logged by the proxy when the running monthly total
   crosses $50 / $100 / $150 / $200 / $250, and when $25 or $10 remain.
   Tracking is observe-only: the proxy never rejects a request for budget.
@@ -435,6 +449,34 @@ which is interpreted as **600 milliseconds** (`x-portkey-request-timeout:
 by default, so the gateway's own default applies. If you want to control it,
 set `PORTKEY_TIMEOUT_MS` in **milliseconds** (e.g. `300000` = 5 min). Check
 the banner (`Gateway timeout: ...`) or the started log to confirm.
+
+**A model shows requests but 0 tokens and $0.00 cost**
+
+The proxy used to record the **first** `usage` block it saw in a stream (v1.8.1
+fixes this). That is wrong for the Azure-hosted Anthropic deployments: they send
+a zero-filled `usage` object on `response.created` / `response.in_progress` and
+only put real counts on `response.completed`, so every streamed
+`claude-opus-5-5` request logged 0 / $0. The tracker now merges every usage
+block in the stream (highest value per field) and records once at the end.
+
+To tell whether your own log is affected, count the zero-token records (they
+also carry valid `rates`, so it is a capture bug, not a pricing one):
+
+```bash
+./.venv/bin/python usage_report.py            # "No token counts" line, v1.8.1+
+python - <<'EOF'
+import json, collections
+c = collections.Counter()
+for line in open("usage.jsonl"):
+    r = json.loads(line)
+    if not (r.get("prompt_tokens") or r.get("completion_tokens") or r.get("total_tokens")):
+        c[r["model"]] += 1
+print(c or "no zero-token records")
+EOF
+```
+
+The old records cannot be reconstructed from the local log — the counts were
+never captured — so spend for the affected period is understated.
 
 ## Configuration reference
 
