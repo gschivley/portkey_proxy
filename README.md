@@ -16,6 +16,7 @@ Exposed models (by default):
 | `gpt-6.1-sol`                 | `gpt-6.1-sol`  |
 | `gpt-6-luna`                  | `gpt-6-luna`   |
 | `gemini-3.8-flash`            | `gemini-3.8-flash` |
+| `gemini-4-argon`              | `gemini-4-argon` |
 | `claude-opus-5-5`             | `claude-opus-5-5` |
 | `claude-sonnet-5-5`           | `claude-sonnet-5-5` |
 | `claude-fable-5-1`            | `claude-fable-5-1` |
@@ -27,7 +28,7 @@ The Portkey aliases are passed through to Portkey as-is. If an alias is not a
 real deployment name on the sandbox, map it to a real model by setting the
 matching `*_UPSTREAM_MODEL` variable (e.g. `GPT56_SOL_UPSTREAM_MODEL`,
 `GPT6_ASTRA_UPSTREAM_MODEL`, `GPT6_SOL_UPSTREAM_MODEL`, `GEMINI38_FLASH_UPSTREAM_MODEL`,
-`CLAUDE_OPUS_55_UPSTREAM_MODEL`, `CLAUDE_SONNET_55_UPSTREAM_MODEL`,
+`GEMINI4_ARGON_UPSTREAM_MODEL`, `CLAUDE_OPUS_55_UPSTREAM_MODEL`, `CLAUDE_SONNET_55_UPSTREAM_MODEL`,
 `CLAUDE_FABLE_51_UPSTREAM_MODEL`; or editing
 `MODEL_REGISTRY` in `proxy.py`) — e.g. `claude-sonnet-4-6`.
 
@@ -137,7 +138,8 @@ export COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:8090/v1
 export COPILOT_PROVIDER_API_KEY=<your Portkey / AI Sandbox key>
 export COPILOT_MODEL=gpt-5.6-sol        # or gpt-5.6-terra / gpt-6-astra /
                                         # gpt-6.1-sol / gpt-6-luna /
-                                        # gemini-3.8-flash / claude-opus-5-5 /
+                                        # gemini-3.8-flash / gemini-4-argon /
+                                        # claude-opus-5-5 /
                                         # claude-sonnet-5-5 / claude-fable-5-1
 copilot
 ```
@@ -285,6 +287,7 @@ Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
   | `gpt-6.1-sol` | `gpt-6-sol` | $2.00 | $0.20 | $2.50 | $10.00 |
   | `gpt-6-luna` | `gpt-6-luna` | $0.01 | $0.001 | $0.0125 | $0.05 |
   | `gemini-3.8-flash` | `gemini-3.8-flash-gt-128k` | $0.75 | $0.075 | – | $3.75 |
+  | `gemini-4-argon` | `gemini-4-argon-gt-128k` | $2.00 | $0.10 | – | $10.00 |
   | `claude-opus-5-5` | `claude-opus-5-5` | $4.00 | $0.20 | $5.00 | $20.00 |
   | `claude-sonnet-5-5` | `claude-sonnet-5-5` | $2.00 | $0.20 | $2.50 | $10.00 |
   | `claude-fable-5-1` | `claude-fable-5-1` | $10.00 | $0.25 | $12.50 | $50.00 |
@@ -328,7 +331,7 @@ disagree about it. Each model in `MODEL_REGISTRY` declares a profile from
 | --------- | -------- | ----------- |
 | `gpt-5.6` | `gpt-5.6-sol/terra`, `gpt-6-luna` | Rejects function `tools` + reasoning together. The proxy strips reasoning when tools are present, and auto-retries with `reasoning_effort: "none"` if the upstream still complains. `"none"` **is** a valid value here. (On `/v1/responses` this profile has no conflict — reasoning is forwarded untouched.) Despite its name, `gpt-6-luna` behaves like this family, not the `gpt-6` one. |
 | `gpt-6` | `gpt-6-astra`, `gpt-6.1-sol` | **No chat-completions shape accepts function tools at all** (see below), so tools-bearing requests are bridged via `/v1/responses` by default. Without tools, `"none"` is **not** a valid effort — supported values are `low`, `medium`, `high`, `xhigh`, and unsupported client values are rewritten to the fallback `low`. |
-| `flexible` | `gemini-3.8-flash`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1` | Accepts tools + reasoning and its own effort vocabulary, so values are forwarded untouched unless you configure an explicit list. |
+| `flexible` | `gemini-3.8-flash`, `gemini-4-argon`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1` | Accepts tools + reasoning and its own effort vocabulary, so values are forwarded untouched unless you configure an explicit list. |
 
 **"Function tools with reasoning_effort are not supported ... set reasoning_effort to 'none'"**
 
@@ -447,10 +450,10 @@ the banner (`Gateway timeout: ...`) or the started log to confirm.
 | `RESPONSES_ENABLED` | `1` | Serve `POST /v1/responses`. Set `0` to disable it (the route then returns a 404 stub, and bridging is disabled too) |
 | `TOOLS_VIA_RESPONSES` | `auto` | Serve chat requests with function tools through the Responses API and translate the reply back: `auto` (only models with no working chat shape for tools, i.e. the `gpt-6` family), `always` (also GPT-5.6, preserving its reasoning), `never` (forward the upstream 400) |
 | `TOOLS_REASONING_EFFORT` | `strip` | For models that reject tools + reasoning (GPT-5.6 only): `strip`, `none`, or `keep` (the alternative is auto-tried on the upstream's tools+reasoning 400) |
-| `GPT56_SOL_UPSTREAM_MODEL` / `GPT56_TERRA_UPSTREAM_MODEL` / `GPT6_ASTRA_UPSTREAM_MODEL` / `GPT6_SOL_UPSTREAM_MODEL` / `GPT6_LUNA_UPSTREAM_MODEL` / `GEMINI38_FLASH_UPSTREAM_MODEL` | alias name | Map an alias to a different upstream model |
+| `GPT56_SOL_UPSTREAM_MODEL` / `GPT56_TERRA_UPSTREAM_MODEL` / `GPT6_ASTRA_UPSTREAM_MODEL` / `GPT6_SOL_UPSTREAM_MODEL` / `GPT6_LUNA_UPSTREAM_MODEL` / `GEMINI38_FLASH_UPSTREAM_MODEL` / `GEMINI4_ARGON_UPSTREAM_MODEL` | alias name | Map an alias to a different upstream model |
 | `QWEN3_UPSTREAM_MODEL` / `DEEPSEEK_V4_FLASH_UPSTREAM_MODEL` / `GLM5_UPSTREAM_MODEL` | alias name | Map an NRP alias to a different upstream model |
 | `GPT6_ASTRA_REASONING_EFFORTS` | `low,medium,high,xhigh` | Comma-separated `reasoning_effort` values the upstream accepts for `gpt-6-astra`; unsupported client values are rewritten to the first non-`none` entry |
-| `GEMINI38_FLASH_REASONING_EFFORTS` / `CLAUDE_OPUS_55_REASONING_EFFORTS` / `CLAUDE_SONNET_55_REASONING_EFFORTS` / `CLAUDE_FABLE_51_REASONING_EFFORTS` | – (unset) | Optional comma-separated `reasoning_effort` list for `gemini-3.8-flash` or a Claude model; when unset, client values are forwarded untouched |
+| `GEMINI38_FLASH_REASONING_EFFORTS` / `GEMINI4_ARGON_REASONING_EFFORTS` / `CLAUDE_OPUS_55_REASONING_EFFORTS` / `CLAUDE_SONNET_55_REASONING_EFFORTS` / `CLAUDE_FABLE_51_REASONING_EFFORTS` | – (unset) | Optional comma-separated `reasoning_effort` list for `gemini-3.8-flash`, `gemini-4-argon` or a Claude model; when unset, client values are forwarded untouched |
 | `USAGE_TRACKING` | `1` | Record token usage and dollar cost of every request to the JSONL usage log |
 | `USAGE_LOG_PATH` | `usage.jsonl` (next to `proxy.py`) | Append-only usage log; also read directly by `usage_report.py` |
 | `MONTHLY_BUDGET_USD` | `250` | Monthly budget used by `/v1/usage` reports and the proxy's budget warning logs |
@@ -458,3 +461,4 @@ the banner (`Gateway timeout: ...`) or the started log to confirm.
 | `PRICING_CACHE_PATH` | `.pricing_cache.json` | Cached pricing responses (refreshed after the TTL; stale cache is used if a refresh fails) |
 | `PRICING_TTL_HOURS` | `24` | How long a cached price is considered fresh |
 | `GEMINI38_FLASH_PRICING_MODEL` | `gemini-3.8-flash-gt-128k` | Pricing-catalog name used for `gemini-3.8-flash` (it is not listed under its request name) |
+| `GEMINI4_ARGON_PRICING_MODEL` | `gemini-4-argon-gt-128k` | Pricing-catalog name used for `gemini-4-argon` (it is not listed under its request name) |
