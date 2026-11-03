@@ -1,0 +1,58 @@
+name: Check dependency sync
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check-deps-sync:
+    name: requirements.txt / pyproject.toml sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compare requirements.txt with pyproject.toml
+        run: |
+          python - <<'PY'
+          import sys
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              pyproject = tomllib.load(f)
+          pyproject_deps = sorted(
+              dep.strip() for dep in pyproject["project"]["dependencies"]
+          )
+
+          req_deps = []
+          with open("requirements.txt") as f:
+              for line in f:
+                  line = line.strip()
+                  if line and not line.startswith("#"):
+                      req_deps.append(line)
+          req_deps.sort()
+
+          if pyproject_deps == req_deps:
+              print("requirements.txt and pyproject.toml are in sync.")
+              sys.exit(0)
+
+          print(
+              "::error::requirements.txt and pyproject.toml "
+              "dependency lists are out of sync"
+          )
+          only_req = sorted(set(req_deps) - set(pyproject_deps))
+          only_pyproject = sorted(set(pyproject_deps) - set(req_deps))
+          if only_req:
+              print("Only in requirements.txt:")
+              for dep in only_req:
+                  print(f"  {dep}")
+          if only_pyproject:
+              print("Only in pyproject.toml:")
+              for dep in only_pyproject:
+                  print(f"  {dep}")
+          print("Update both files so they match.")
+          sys.exit(1)
+          PY
