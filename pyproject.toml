@@ -1,0 +1,16 @@
+[project]
+name = "portkey-proxy"
+version = "0.1.0"
+description = "Local OpenAI-compatible proxy for GitHub Copilot to the Princeton AI Sandbox (Portkey gateway)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "portkey-ai>=2.3.4",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+]
+
+[tool.uv]
+package = false

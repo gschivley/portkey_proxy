@@ -100,6 +100,15 @@ pip install -r requirements.txt
 python proxy.py
 ```
 
+Or with [uv](https://docs.astral.sh/uv/) (reads `pyproject.toml`, creates
+`.venv` automatically):
+
+```bash
+uv sync          # create .venv and install dependencies
+uv run proxy.py  # start the proxy
+uv run test_proxy.py   # run the tests
+```
+
 You should see:
 
 ```
