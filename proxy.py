@@ -1165,6 +1165,45 @@ def _responses_to_chat_usage(usage: Any) -> Optional[Dict[str, Any]]:
     return out
 
 
+# Providers that don't speak OpenAI chat-completions natively put their own
+# stop-reason vocabulary in `finish_reason` (Anthropic's `tool_use`/`end_turn`,
+# Gemini's upper-case `TOOL_CALLS`/`SAFETY`). The chat passthrough forwards
+# chunks untouched, and a client that only knows the OpenAI enum never treats
+# such a turn as a tool call, so the values are mapped before they go out.
+_FINISH_REASON_ALIASES = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "pause_turn": "stop",
+    "tool_use": "tool_calls",
+    "max_tokens": "length",
+    "refusal": "content_filter",
+    "safety": "content_filter",
+    "recitation": "content_filter",
+}
+_OPENAI_FINISH_REASONS = frozenset({"stop", "length", "tool_calls", "content_filter"})
+
+
+def _normalize_finish_reason(value: Any) -> Any:
+    """Rewrite a provider stop-reason as an OpenAI `finish_reason` value."""
+    if not isinstance(value, str):
+        return value
+    key = value.strip().lower()
+    if key in _OPENAI_FINISH_REASONS:
+        return key
+    mapped = _FINISH_REASON_ALIASES.get(key)
+    if mapped is not None:
+        return mapped
+    logging.warning("Unrecognised finish_reason %r forwarded unchanged", value)
+    return value
+
+
+def _normalize_chat_finish_reasons(data: Dict[str, Any]) -> None:
+    """Normalise `choices[].finish_reason` of a chat.completion body in place."""
+    for choice in data.get("choices") or []:
+        if isinstance(choice, dict) and choice.get("finish_reason") is not None:
+            choice["finish_reason"] = _normalize_finish_reason(choice["finish_reason"])
+
+
 def _bridge_finish_reason(
     data: Dict[str, Any], tool_calls: List[Dict[str, Any]]
 ) -> str:
@@ -1749,7 +1788,7 @@ def _chat_to_responses_completion(data: Dict[str, Any], alias: str) -> Dict[str,
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     output = _chat_message_to_output_items(message)
-    finish = choice.get("finish_reason")
+    finish = _normalize_finish_reason(choice.get("finish_reason"))
     status = "incomplete" if finish == "length" else "completed"
     created = data.get("created")
     return {
@@ -1931,7 +1970,9 @@ class _ChatToResponsesSSE:
                     )
                 )
         if choice.get("finish_reason"):
-            self.finish_reason = choice["finish_reason"]
+            # `length` decides whether the Responses side reports `incomplete`,
+            # so accept the provider spellings of "ran out of tokens" too.
+            self.finish_reason = _normalize_finish_reason(choice["finish_reason"])
         return out
 
     def finish(self) -> List[str]:
@@ -2404,6 +2445,10 @@ def _sse_stream(
             yielded_any = True
             data = to_json_dict(chunk)
             data["model"] = alias  # report the name the client asked for
+            # Everything else is forwarded untouched, including a provider's
+            # own stop-reason vocabulary (`tool_use`, `TOOL_CALLS`), which the
+            # client can't act on; normalise it to the OpenAI enum.
+            _normalize_chat_finish_reasons(data)
             usage_tracker.observe(data)
             yield sse_frame(data)
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
@@ -2629,6 +2674,7 @@ async def chat_completions(request: Request):
                 content=_error_payload(message, err_type, code, param),
             )
         data["model"] = alias
+        _normalize_chat_finish_reasons(data)
         data.setdefault("object", "chat.completion")
         _track_usage(alias, data.get("usage"), stream=False)
         return JSONResponse(data)

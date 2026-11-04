@@ -127,6 +127,9 @@ async def chat_completions(request: Request):
     cache_write_tokens = body.pop("mock_cache_write_tokens", None)
     # Test-only directive: reply with a tool call instead of a text message.
     chat_tool_call = body.pop("mock_chat_tool_call", None)
+    # Test-only directive: the `finish_reason` to report (a provider-native
+    # value here checks the proxy's normalisation).
+    mock_finish_reason = body.pop("mock_finish_reason", None)
     _record(request, body)
     model = body.get("model", "unknown")
     now = int(time.time())
@@ -215,6 +218,10 @@ async def chat_completions(request: Request):
         else:
             message = {"role": "assistant", "content": "Hello from mock upstream!"}
             finish = "stop"
+        # `mock_finish_reason` lets a test replay a provider-native stop reason
+        # (Anthropic's `tool_use`, Gemini's `TOOL_CALLS`) on an otherwise
+        # OpenAI-shaped reply, to check the proxy normalises it.
+        finish = mock_finish_reason or finish
         return {
             "id": "cmpl-mock-0001",
             "object": "chat.completion",
@@ -336,7 +343,8 @@ async def chat_completions(request: Request):
                     {
                         "index": 0,
                         "delta": {},
-                        "finish_reason": "tool_calls" if chat_tool_call else "stop",
+                        "finish_reason": mock_finish_reason
+                        or ("tool_calls" if chat_tool_call else "stop"),
                     }
                 ],
             }

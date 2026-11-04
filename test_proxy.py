@@ -855,6 +855,69 @@ def main() -> int:
             str(cap["body"].get("stream")),
         )
 
+        # Providers that don't speak OpenAI chat natively report their own stop
+        # reason: `tool_use` for the claude deployments, upper-case `TOOL_CALLS`
+        # for gemini's (both verified live against the Sandbox). Copilot only
+        # acts on the OpenAI enum, so a passthrough stream must not carry them.
+        passthrough_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        for provider_reason, expected in (
+            ("tool_use", "tool_calls"),
+            ("TOOL_CALLS", "tool_calls"),
+            ("end_turn", "stop"),
+            ("max_tokens", "length"),
+        ):
+            r = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "claude-opus-5-5",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": passthrough_tools,
+                    "stream": True,
+                    "mock_chat_tool_call": True,
+                    "mock_finish_reason": provider_reason,
+                },
+            )
+            finish = [
+                c.get("finish_reason")
+                for f in parse_sse(r.text)
+                if f.get("choices") and not f.get("done")
+                for c in f["choices"]
+                if c.get("finish_reason")
+            ]
+            check(
+                f"stream: provider finish_reason {provider_reason!r} -> {expected!r}",
+                finish == [expected],
+                str(finish),
+            )
+            r = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "claude-opus-5-5",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": passthrough_tools,
+                    "mock_chat_tool_call": True,
+                    "mock_finish_reason": provider_reason,
+                },
+            )
+            check(
+                f"non-stream: provider finish_reason {provider_reason!r} -> {expected!r}",
+                r.status_code == 200
+                and r.json()["choices"][0]["finish_reason"] == expected,
+                str(r.json().get("choices")),
+            )
+
         # 4. Errors -------------------------------------------------------
         r = client.post(
             "/v1/chat/completions", json={"model": "does-not-exist", "messages": []}
