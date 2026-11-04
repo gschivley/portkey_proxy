@@ -1248,6 +1248,7 @@ class _ResponsesToChatSSE:
         self.created = int(time.time())
         self.tool_indexes: Dict[Any, int] = {}
         self.next_tool_index = 0
+        self.last_tool_index: Optional[int] = None
         self.tool_meta: Dict[int, Dict[str, str]] = {}
         self.tool_headers: set = set()
         self.finish_reason: Optional[str] = None
@@ -1283,7 +1284,7 @@ class _ResponsesToChatSSE:
             [] if self.started else [self._chunk({"role": "assistant", "content": ""})]
         )
 
-    def _tool_index(self, *keys: Any) -> int:
+    def _tool_index(self, *keys: Any, mint: bool = True) -> int:
         """Stable chat tool_call index for a Responses event.
 
         Upstreams identify the same function call by different fields per
@@ -1293,6 +1294,12 @@ class _ResponsesToChatSSE:
         into two chat tool_calls -- one with the id and one with the
         arguments -- which clients reject with a "missing ... [n].id" stream
         assembly error.
+
+        `mint` says whether an unrecognised event may open a new call: the
+        item event introduces calls, an argument delta only continues one.
+        With `mint` off, an unmatchable delta keeps streaming into
+        `last_tool_index` (or the sole known call), which is what upstreams
+        that identify deltas purely positionally, or not at all, intend.
         """
         for key in keys:
             if key is not None and key in self.tool_indexes:
@@ -1300,12 +1307,26 @@ class _ResponsesToChatSSE:
                 for other in keys:
                     if other is not None:
                         self.tool_indexes[other] = index
+                self.last_tool_index = index
                 return index
+        if not mint:
+            named = [k for k in keys if k is not None]
+            if not named or (len(named) == 1 and len(self.tool_meta) == 1):
+                # A positional-only delta for the only call in flight.
+                fallback = (
+                    self.last_tool_index
+                    if self.last_tool_index is not None
+                    else next(iter(self.tool_meta), None)
+                )
+                if fallback is not None:
+                    self.last_tool_index = fallback
+                    return fallback
         index = self.next_tool_index
         self.next_tool_index += 1
         for key in keys:
             if key is not None:
                 self.tool_indexes[key] = index
+        self.last_tool_index = index
         return index
 
     def _record_tool(self, index: int, call_id: Any, name: Any) -> None:
@@ -1366,8 +1387,12 @@ class _ResponsesToChatSSE:
                 event.get("item_id"),
                 event.get("call_id"),
                 event.get("output_index"),
+                mint=False,
             )
             self.finish_reason = "tool_calls"
+            # A call whose output_item.added never arrived still needs an id
+            # on the index its arguments went to; finish() supplies the header.
+            self._record_tool(index, event.get("call_id"), None)
             return self._start() + [
                 self._chunk(
                     {"tool_calls": [{"index": index, "function": {"arguments": delta}}]}

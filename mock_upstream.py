@@ -505,31 +505,40 @@ async def responses(request: Request):
         if isinstance(tool_call, dict):
             # Real upstreams add the item with empty arguments, then stream the
             # arguments as deltas -- the same split the bridge must reassemble.
-            yield event(
-                {
-                    "type": "response.output_item.added",
-                    "output_index": 0,
-                    "item": {
-                        "id": "fc-mock-0001",
-                        "type": "function_call",
-                        "call_id": output_items[0]["call_id"],
-                        "name": output_items[0]["name"],
-                        "arguments": "",
-                        "status": "in_progress",
-                    },
-                }
-            )
+            # `delta_identity` varies *how* the deltas name their call, because
+            # upstreams disagree: "item_id" (OpenAI's shape, which the bridge
+            # must join to the item's call_id), "positional" (output_index
+            # only) and "none" (no identifier at all, so the delta can only
+            # continue the call already streaming).
+            identity = tool_call.get("delta_identity") or "item_id"
+            added = {
+                "type": "response.output_item.added",
+                "item": {
+                    "id": "fc-mock-0001",
+                    "type": "function_call",
+                    "call_id": output_items[0]["call_id"],
+                    "name": output_items[0]["name"],
+                    "arguments": "",
+                    "status": "in_progress",
+                },
+            }
+            if identity != "positional":
+                added["output_index"] = 0
+            if not tool_call.get("omit_added_event"):
+                yield event(added)
             arguments = output_items[0]["arguments"]
             step = max(1, len(arguments) // 2)
             for start in range(0, len(arguments), step):
-                yield event(
-                    {
-                        "type": "response.function_call_arguments.delta",
-                        "item_id": "fc-mock-0001",
-                        "output_index": 0,
-                        "delta": arguments[start : start + step],
-                    }
-                )
+                delta_event: Dict[str, Any] = {
+                    "type": "response.function_call_arguments.delta",
+                    "delta": arguments[start : start + step],
+                }
+                if identity == "item_id":
+                    delta_event["item_id"] = "fc-mock-0001"
+                    delta_event["output_index"] = 0
+                elif identity == "positional":
+                    delta_event["output_index"] = 0
+                yield event(delta_event)
             yield event(
                 {
                     "type": "response.function_call_arguments.done",

@@ -1515,6 +1515,53 @@ def main() -> int:
             str(usage_frames),
         )
 
+        # Upstreams disagree about how argument deltas name their call, and the
+        # chat stream must look identical to the client whichever it gets: one
+        # tool_call index, carrying both the id and the whole argument text.
+        def assemble_tool_calls(resp_frames):
+            by_index = {}
+            for delta in (
+                c.get("delta", {})
+                for f in resp_frames
+                if not f.get("done")
+                for c in f.get("choices") or []
+            ):
+                for call in delta.get("tool_calls") or []:
+                    entry = by_index.setdefault(
+                        call.get("index"), {"id": None, "name": None, "args": ""}
+                    )
+                    if call.get("id"):
+                        entry["id"] = call["id"]
+                    fn = call.get("function") or {}
+                    if fn.get("name"):
+                        entry["name"] = fn["name"]
+                    entry["args"] += fn.get("arguments") or ""
+            return by_index
+
+        for variant, extra in (
+            ("output_index-keyed", {"delta_identity": "positional"}),
+            ("unnamed", {"delta_identity": "none"}),
+            ("no item event", {"omit_added_event": True}),
+        ):
+            r = client.post(
+                "/v1/chat/completions",
+                json={
+                    **bridge_body,
+                    "stream": True,
+                    "mock_tool_call": {"name": "f", "arguments": '{"city":"Paris"}', **extra},
+                },
+            )
+            by_index = assemble_tool_calls(parse_sse(r.text))
+            check(
+                f"bridge stream: {variant} argument deltas stay on one call",
+                r.status_code == 200
+                and list(by_index) == [0]
+                and by_index[0]["name"] == "f"
+                and by_index[0]["args"] == '{"city":"Paris"}'
+                and bool(by_index[0]["id"]),
+                str(by_index),
+            )
+
         # Copilot sends `stream_options` on every streaming chat request, but
         # the Responses upstream rejects it outright -- the bridge must drop it
         # (usage still arrives, via response.completed).

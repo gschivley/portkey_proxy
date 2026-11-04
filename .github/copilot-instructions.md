@@ -19,7 +19,7 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the full integration test suite (229 checks; boots a mock upstream + the real proxy)
+# Run the full integration test suite (259 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -55,7 +55,11 @@ pip install -r requirements.txt
   rejects chat-only `stream_options` the way the real one does). Test-only
   `mock_tool_call` makes the responses route emit a `function_call` item (with
   streamed argument deltas) instead of a message; `mock_chat_tool_call` does the
-  same on the chat route. `_captured.json` also records the request `path`. Also serves
+  same on the chat route. Inside `mock_tool_call`, `delta_identity`
+  (`item_id`/`positional`/`none`) picks how the argument deltas name their call
+  and `omit_added_event` drops the `response.output_item.added` frame, so the
+  bridge is exercised against every upstream labelling shape.
+  `_captured.json` also records the request `path`. Also serves
   `GET /pricing/<provider>/<model>` (fixed `openai`/`google` rates; `anthropic`
   404s to exercise the no-pricing path) and honors a `mock_cached_tokens` field to
   report cached input tokens in `usage` and a `mock_cache_write_tokens` field to
@@ -228,4 +232,4 @@ pip install -r requirements.txt
   actually forwarded; it's gitignored and deleted at the end of the run.
 - Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log` (gitignored).
 - After changing proxy behavior, run `./.venv/bin/python test_proxy.py` and
-  confirm "ALL TESTS PASSED" (229 checks).
+  confirm "ALL TESTS PASSED" (259 checks).

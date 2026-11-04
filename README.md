@@ -459,9 +459,12 @@ the call's id and its argument deltas two different indexes (it keyed
 `response.output_item.added` by `call_id` and the argument deltas by
 `item_id`), so index 1 collected arguments that never had an id. Fixed: every
 identifier for a function call (`item.id` / `item_id` / `call_id` /
-`output_index`) now maps to one chat `tool_calls` index, and any tool call that
-only shows up in the final `response.completed` payload still gets an
-id/name header frame before `finish_reason`.
+`output_index`) now maps to one chat `tool_calls` index. Upstreams label
+argument deltas inconsistently, so the translator also handles deltas keyed
+only by position, and deltas carrying no identifier at all (they continue the
+call already streaming rather than starting a new one), and any tool call that
+appears only in the final `response.completed` payload still gets an id/name
+header frame before `finish_reason`.
 
 For a model that is **not** bridged (e.g. `claude-opus-5-5` with the default
 `TOOLS_VIA_RESPONSES=auto`), the chunks are forwarded upstream-to-client
