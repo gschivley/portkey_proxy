@@ -855,6 +855,69 @@ def main() -> int:
             str(cap["body"].get("stream")),
         )
 
+        # Providers that don't speak OpenAI chat natively report their own stop
+        # reason: `tool_use` for the claude deployments, upper-case `TOOL_CALLS`
+        # for gemini's (both verified live against the Sandbox). Copilot only
+        # acts on the OpenAI enum, so a passthrough stream must not carry them.
+        passthrough_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        for provider_reason, expected in (
+            ("tool_use", "tool_calls"),
+            ("TOOL_CALLS", "tool_calls"),
+            ("end_turn", "stop"),
+            ("max_tokens", "length"),
+        ):
+            r = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "claude-opus-5-5",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": passthrough_tools,
+                    "stream": True,
+                    "mock_chat_tool_call": True,
+                    "mock_finish_reason": provider_reason,
+                },
+            )
+            finish = [
+                c.get("finish_reason")
+                for f in parse_sse(r.text)
+                if f.get("choices") and not f.get("done")
+                for c in f["choices"]
+                if c.get("finish_reason")
+            ]
+            check(
+                f"stream: provider finish_reason {provider_reason!r} -> {expected!r}",
+                finish == [expected],
+                str(finish),
+            )
+            r = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "claude-opus-5-5",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": passthrough_tools,
+                    "mock_chat_tool_call": True,
+                    "mock_finish_reason": provider_reason,
+                },
+            )
+            check(
+                f"non-stream: provider finish_reason {provider_reason!r} -> {expected!r}",
+                r.status_code == 200
+                and r.json()["choices"][0]["finish_reason"] == expected,
+                str(r.json().get("choices")),
+            )
+
         # 4. Errors -------------------------------------------------------
         r = client.post(
             "/v1/chat/completions", json={"model": "does-not-exist", "messages": []}
@@ -1460,21 +1523,35 @@ def main() -> int:
             if not f.get("done")
             for c in f.get("choices") or []
         ]
-        rebuilt = {"args": "", "name": None, "id": None}
+        # Accumulate by tool_call index, the way a client assembles a stream:
+        # every index must end up with an id, a name and its argument text.
+        # Keys (id/arguments) arriving under two different indexes is the
+        # "missing choices[0].tool_calls[N].id" regression.
+        rebuilt_by_index = {}
         for delta in deltas:
             for call in delta.get("tool_calls") or []:
+                entry = rebuilt_by_index.setdefault(
+                    call.get("index", 0), {"args": "", "name": None, "id": None}
+                )
                 if call.get("id"):
-                    rebuilt["id"] = call["id"]
+                    entry["id"] = call["id"]
                 fn = call.get("function") or {}
                 if fn.get("name"):
-                    rebuilt["name"] = fn["name"]
-                rebuilt["args"] += fn.get("arguments") or ""
+                    entry["name"] = fn["name"]
+                entry["args"] += fn.get("arguments") or ""
+        rebuilt = rebuilt_by_index.get(0, {})
         check(
             "bridge stream: tool call reassembled from argument deltas",
-            rebuilt["name"] == "f"
-            and rebuilt["args"] == '{"city":"Paris"}'
-            and bool(rebuilt["id"]),
-            str(rebuilt),
+            rebuilt.get("name") == "f"
+            and rebuilt.get("args") == '{"city":"Paris"}'
+            and bool(rebuilt.get("id")),
+            str(rebuilt_by_index),
+        )
+        check(
+            "bridge stream: one tool call, one index, with an id",
+            list(rebuilt_by_index) == [0]
+            and all(entry["id"] for entry in rebuilt_by_index.values()),
+            str(rebuilt_by_index),
         )
         check(
             "bridge stream: role delta first",
@@ -1500,6 +1577,53 @@ def main() -> int:
             and usage_frames[0]["usage"].get("prompt_tokens") == 12,
             str(usage_frames),
         )
+
+        # Upstreams disagree about how argument deltas name their call, and the
+        # chat stream must look identical to the client whichever it gets: one
+        # tool_call index, carrying both the id and the whole argument text.
+        def assemble_tool_calls(resp_frames):
+            by_index = {}
+            for delta in (
+                c.get("delta", {})
+                for f in resp_frames
+                if not f.get("done")
+                for c in f.get("choices") or []
+            ):
+                for call in delta.get("tool_calls") or []:
+                    entry = by_index.setdefault(
+                        call.get("index"), {"id": None, "name": None, "args": ""}
+                    )
+                    if call.get("id"):
+                        entry["id"] = call["id"]
+                    fn = call.get("function") or {}
+                    if fn.get("name"):
+                        entry["name"] = fn["name"]
+                    entry["args"] += fn.get("arguments") or ""
+            return by_index
+
+        for variant, extra in (
+            ("output_index-keyed", {"delta_identity": "positional"}),
+            ("unnamed", {"delta_identity": "none"}),
+            ("no item event", {"omit_added_event": True}),
+        ):
+            r = client.post(
+                "/v1/chat/completions",
+                json={
+                    **bridge_body,
+                    "stream": True,
+                    "mock_tool_call": {"name": "f", "arguments": '{"city":"Paris"}', **extra},
+                },
+            )
+            by_index = assemble_tool_calls(parse_sse(r.text))
+            check(
+                f"bridge stream: {variant} argument deltas stay on one call",
+                r.status_code == 200
+                and list(by_index) == [0]
+                and by_index[0]["name"] == "f"
+                and by_index[0]["args"] == '{"city":"Paris"}'
+                and bool(by_index[0]["id"]),
+                str(by_index),
+            )
 
         # Copilot sends `stream_options` on every streaming chat request, but
         # the Responses upstream rejects it outright -- the bridge must drop it

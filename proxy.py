@@ -1165,6 +1165,45 @@ def _responses_to_chat_usage(usage: Any) -> Optional[Dict[str, Any]]:
     return out
 
 
+# Providers that don't speak OpenAI chat-completions natively put their own
+# stop-reason vocabulary in `finish_reason` (Anthropic's `tool_use`/`end_turn`,
+# Gemini's upper-case `TOOL_CALLS`/`SAFETY`). The chat passthrough forwards
+# chunks untouched, and a client that only knows the OpenAI enum never treats
+# such a turn as a tool call, so the values are mapped before they go out.
+_FINISH_REASON_ALIASES = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "pause_turn": "stop",
+    "tool_use": "tool_calls",
+    "max_tokens": "length",
+    "refusal": "content_filter",
+    "safety": "content_filter",
+    "recitation": "content_filter",
+}
+_OPENAI_FINISH_REASONS = frozenset({"stop", "length", "tool_calls", "content_filter"})
+
+
+def _normalize_finish_reason(value: Any) -> Any:
+    """Rewrite a provider stop-reason as an OpenAI `finish_reason` value."""
+    if not isinstance(value, str):
+        return value
+    key = value.strip().lower()
+    if key in _OPENAI_FINISH_REASONS:
+        return key
+    mapped = _FINISH_REASON_ALIASES.get(key)
+    if mapped is not None:
+        return mapped
+    logging.warning("Unrecognised finish_reason %r forwarded unchanged", value)
+    return value
+
+
+def _normalize_chat_finish_reasons(data: Dict[str, Any]) -> None:
+    """Normalise `choices[].finish_reason` of a chat.completion body in place."""
+    for choice in data.get("choices") or []:
+        if isinstance(choice, dict) and choice.get("finish_reason") is not None:
+            choice["finish_reason"] = _normalize_finish_reason(choice["finish_reason"])
+
+
 def _bridge_finish_reason(
     data: Dict[str, Any], tool_calls: List[Dict[str, Any]]
 ) -> str:
@@ -1248,6 +1287,9 @@ class _ResponsesToChatSSE:
         self.created = int(time.time())
         self.tool_indexes: Dict[Any, int] = {}
         self.next_tool_index = 0
+        self.last_tool_index: Optional[int] = None
+        self.tool_meta: Dict[int, Dict[str, str]] = {}
+        self.tool_headers: set = set()
         self.finish_reason: Optional[str] = None
         self.usage: Optional[Dict[str, Any]] = None
 
@@ -1281,13 +1323,59 @@ class _ResponsesToChatSSE:
             [] if self.started else [self._chunk({"role": "assistant", "content": ""})]
         )
 
-    def _tool_index(self, key: Any) -> int:
-        if key is None:
-            return self.next_tool_index
-        if key not in self.tool_indexes:
-            self.tool_indexes[key] = self.next_tool_index
-            self.next_tool_index += 1
-        return self.tool_indexes[key]
+    def _tool_index(self, *keys: Any, mint: bool = True) -> int:
+        """Stable chat tool_call index for a Responses event.
+
+        Upstreams identify the same function call by different fields per
+        event (`item.id` on output_item.added, `item_id` on argument deltas,
+        `call_id`/`output_index` elsewhere), so every key that names this call
+        must map to one chat index. Keying them separately split a single call
+        into two chat tool_calls -- one with the id and one with the
+        arguments -- which clients reject with a "missing ... [n].id" stream
+        assembly error.
+
+        `mint` says whether an unrecognised event may open a new call: the
+        item event introduces calls, an argument delta only continues one.
+        With `mint` off, an unmatchable delta keeps streaming into
+        `last_tool_index` (or the sole known call), which is what upstreams
+        that identify deltas purely positionally, or not at all, intend.
+        """
+        for key in keys:
+            if key is not None and key in self.tool_indexes:
+                index = self.tool_indexes[key]
+                for other in keys:
+                    if other is not None:
+                        self.tool_indexes[other] = index
+                self.last_tool_index = index
+                return index
+        if not mint:
+            named = [k for k in keys if k is not None]
+            if not named or (len(named) == 1 and len(self.tool_meta) == 1):
+                # A positional-only delta for the only call in flight.
+                fallback = (
+                    self.last_tool_index
+                    if self.last_tool_index is not None
+                    else next(iter(self.tool_meta), None)
+                )
+                if fallback is not None:
+                    self.last_tool_index = fallback
+                    return fallback
+        index = self.next_tool_index
+        self.next_tool_index += 1
+        for key in keys:
+            if key is not None:
+                self.tool_indexes[key] = index
+        self.last_tool_index = index
+        return index
+
+    def _record_tool(self, index: int, call_id: Any, name: Any) -> None:
+        meta = self.tool_meta.setdefault(index, {"id": "", "name": ""})
+        if call_id:
+            meta["id"] = str(call_id)
+        elif not meta["id"]:
+            meta["id"] = f"call_{index}"
+        if name:
+            meta["name"] = str(name)
 
     def consume(self, event: Dict[str, Any]) -> List[str]:
         """Translate one Responses event into zero or more chat chunks."""
@@ -1299,8 +1387,15 @@ class _ResponsesToChatSSE:
             item = event.get("item") or {}
             if item.get("type") != "function_call":
                 return []
-            index = self._tool_index(item.get("call_id") or event.get("output_index"))
+            index = self._tool_index(
+                item.get("call_id"),
+                item.get("id"),
+                event.get("item_id"),
+                event.get("output_index"),
+            )
             self.finish_reason = "tool_calls"
+            self._record_tool(index, item.get("call_id"), item.get("name"))
+            self.tool_headers.add(index)
             return self._start() + [
                 self._chunk(
                     {
@@ -1327,8 +1422,16 @@ class _ResponsesToChatSSE:
             delta = event.get("delta")
             if not isinstance(delta, str) or not delta:
                 return []
-            index = self._tool_index(event.get("item_id") or event.get("output_index"))
+            index = self._tool_index(
+                event.get("item_id"),
+                event.get("call_id"),
+                event.get("output_index"),
+                mint=False,
+            )
             self.finish_reason = "tool_calls"
+            # A call whose output_item.added never arrived still needs an id
+            # on the index its arguments went to; finish() supplies the header.
+            self._record_tool(index, event.get("call_id"), None)
             return self._start() + [
                 self._chunk(
                     {"tool_calls": [{"index": index, "function": {"arguments": delta}}]}
@@ -1363,10 +1466,39 @@ class _ResponsesToChatSSE:
             self.finish_reason = "tool_calls" if tool_calls else "stop"
         else:
             self.finish_reason = _bridge_finish_reason(response, tool_calls)
+        # Some upstreams only surface a function_call in the final payload;
+        # still give the chat client an id/name header for it in `finish()`.
+        for item in tool_calls:
+            index = self._tool_index(item.get("call_id"), item.get("id"))
+            self._record_tool(
+                index, item.get("call_id") or item.get("id"), item.get("name")
+            )
 
     def finish(self) -> List[str]:
         """Closing frames: finish_reason, optional usage, and [DONE]."""
         out = self._start()
+        for index in sorted(self.tool_meta):
+            if index in self.tool_headers:
+                continue
+            meta = self.tool_meta[index]
+            out.append(
+                self._chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": index,
+                                "id": meta["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": meta["name"],
+                                    "arguments": "",
+                                },
+                            }
+                        ]
+                    }
+                )
+            )
+            self.tool_headers.add(index)
         out.append(self._chunk({}, self.finish_reason or "stop"))
         if self.usage:
             out.append(sse_frame({**self._base(), "choices": [], "usage": self.usage}))
@@ -1656,7 +1788,7 @@ def _chat_to_responses_completion(data: Dict[str, Any], alias: str) -> Dict[str,
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     output = _chat_message_to_output_items(message)
-    finish = choice.get("finish_reason")
+    finish = _normalize_finish_reason(choice.get("finish_reason"))
     status = "incomplete" if finish == "length" else "completed"
     created = data.get("created")
     return {
@@ -1838,7 +1970,9 @@ class _ChatToResponsesSSE:
                     )
                 )
         if choice.get("finish_reason"):
-            self.finish_reason = choice["finish_reason"]
+            # `length` decides whether the Responses side reports `incomplete`,
+            # so accept the provider spellings of "ran out of tokens" too.
+            self.finish_reason = _normalize_finish_reason(choice["finish_reason"])
         return out
 
     def finish(self) -> List[str]:
@@ -2311,6 +2445,10 @@ def _sse_stream(
             yielded_any = True
             data = to_json_dict(chunk)
             data["model"] = alias  # report the name the client asked for
+            # Everything else is forwarded untouched, including a provider's
+            # own stop-reason vocabulary (`tool_use`, `TOOL_CALLS`), which the
+            # client can't act on; normalise it to the OpenAI enum.
+            _normalize_chat_finish_reasons(data)
             usage_tracker.observe(data)
             yield sse_frame(data)
     except Exception as exc:  # noqa: BLE001 - translate every failure into SSE
@@ -2536,6 +2674,7 @@ async def chat_completions(request: Request):
                 content=_error_payload(message, err_type, code, param),
             )
         data["model"] = alias
+        _normalize_chat_finish_reasons(data)
         data.setdefault("object", "chat.completion")
         _track_usage(alias, data.get("usage"), stream=False)
         return JSONResponse(data)

@@ -450,6 +450,45 @@ when you control the client.
   `TOOLS_VIA_RESPONSES=never` isolates whether the bridge or the upstream is
   at fault.
 
+**"Failed to finalize chat-completions stream: missing choices[0].tool_calls[N].id"**
+
+The Copilot app assembles streaming tool calls by their `index` and needs each
+index to carry an `id`. If the log shows `chat request bridged via responses:
+...` for the failing request, the proxy's Responses→chat translator was giving
+the call's id and its argument deltas two different indexes (it keyed
+`response.output_item.added` by `call_id` and the argument deltas by
+`item_id`), so index 1 collected arguments that never had an id. Fixed: every
+identifier for a function call (`item.id` / `item_id` / `call_id` /
+`output_index`) now maps to one chat `tool_calls` index. Upstreams label
+argument deltas inconsistently, so the translator also handles deltas keyed
+only by position, and deltas carrying no identifier at all (they continue the
+call already streaming rather than starting a new one), and any tool call that
+appears only in the final `response.completed` payload still gets an id/name
+header frame before `finish_reason`.
+
+For a model that is **not** bridged (e.g. `claude-opus-5-5` with the default
+`TOOLS_VIA_RESPONSES=auto`), the chunks are forwarded upstream-to-client
+untouched, so the same message means the upstream itself streamed a tool call
+without an `id`. Set `TOOLS_VIA_RESPONSES=always` to route it through the
+translator too, or capture the raw stream to confirm the upstream shape.
+(Live capture of the Sandbox's claude deployments shows correct `id`s on every
+call, so a claude-side failure is usually the finish-reason problem below
+rather than this one.)
+
+**Tool calls that are streamed but never executed / a turn that just stops**
+
+The claude and gemini deployments answer chat-completions with their own stop
+reasons rather than OpenAI's — `finish_reason: "tool_use"` (claude) and
+`"TOOL_CALLS"` (gemini, upper case), on both streaming and non-streaming
+replies. Copilot only acts on the OpenAI enum, so a turn that ends with
+`tool_use` reads as an ordinary stop: the tool call is dropped and the agent
+ stalls. The proxy now maps the provider spellings onto OpenAI's
+(`tool_use` → `tool_calls`, `end_turn` / `stop_sequence` / `pause_turn` →
+`stop`, `max_tokens` → `length`, `refusal` / `safety` / `recitation` →
+`content_filter`) and logs `Unrecognised finish_reason ...` if a deployment
+invents a new one, so an unexpected value is visible in the log instead of
+silently swallowed.
+
 **"408 Request exceeded the timeout sent in the request: 600ms"**
 
 The proxy was sending a per-request timeout of `600` to the Portkey gateway,
