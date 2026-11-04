@@ -1460,21 +1460,35 @@ def main() -> int:
             if not f.get("done")
             for c in f.get("choices") or []
         ]
-        rebuilt = {"args": "", "name": None, "id": None}
+        # Accumulate by tool_call index, the way a client assembles a stream:
+        # every index must end up with an id, a name and its argument text.
+        # Keys (id/arguments) arriving under two different indexes is the
+        # "missing choices[0].tool_calls[N].id" regression.
+        rebuilt_by_index = {}
         for delta in deltas:
             for call in delta.get("tool_calls") or []:
+                entry = rebuilt_by_index.setdefault(
+                    call.get("index", 0), {"args": "", "name": None, "id": None}
+                )
                 if call.get("id"):
-                    rebuilt["id"] = call["id"]
+                    entry["id"] = call["id"]
                 fn = call.get("function") or {}
                 if fn.get("name"):
-                    rebuilt["name"] = fn["name"]
-                rebuilt["args"] += fn.get("arguments") or ""
+                    entry["name"] = fn["name"]
+                entry["args"] += fn.get("arguments") or ""
+        rebuilt = rebuilt_by_index.get(0, {})
         check(
             "bridge stream: tool call reassembled from argument deltas",
-            rebuilt["name"] == "f"
-            and rebuilt["args"] == '{"city":"Paris"}'
-            and bool(rebuilt["id"]),
-            str(rebuilt),
+            rebuilt.get("name") == "f"
+            and rebuilt.get("args") == '{"city":"Paris"}'
+            and bool(rebuilt.get("id")),
+            str(rebuilt_by_index),
+        )
+        check(
+            "bridge stream: one tool call, one index, with an id",
+            list(rebuilt_by_index) == [0]
+            and all(entry["id"] for entry in rebuilt_by_index.values()),
+            str(rebuilt_by_index),
         )
         check(
             "bridge stream: role delta first",

@@ -1248,6 +1248,8 @@ class _ResponsesToChatSSE:
         self.created = int(time.time())
         self.tool_indexes: Dict[Any, int] = {}
         self.next_tool_index = 0
+        self.tool_meta: Dict[int, Dict[str, str]] = {}
+        self.tool_headers: set = set()
         self.finish_reason: Optional[str] = None
         self.usage: Optional[Dict[str, Any]] = None
 
@@ -1281,13 +1283,39 @@ class _ResponsesToChatSSE:
             [] if self.started else [self._chunk({"role": "assistant", "content": ""})]
         )
 
-    def _tool_index(self, key: Any) -> int:
-        if key is None:
-            return self.next_tool_index
-        if key not in self.tool_indexes:
-            self.tool_indexes[key] = self.next_tool_index
-            self.next_tool_index += 1
-        return self.tool_indexes[key]
+    def _tool_index(self, *keys: Any) -> int:
+        """Stable chat tool_call index for a Responses event.
+
+        Upstreams identify the same function call by different fields per
+        event (`item.id` on output_item.added, `item_id` on argument deltas,
+        `call_id`/`output_index` elsewhere), so every key that names this call
+        must map to one chat index. Keying them separately split a single call
+        into two chat tool_calls -- one with the id and one with the
+        arguments -- which clients reject with a "missing ... [n].id" stream
+        assembly error.
+        """
+        for key in keys:
+            if key is not None and key in self.tool_indexes:
+                index = self.tool_indexes[key]
+                for other in keys:
+                    if other is not None:
+                        self.tool_indexes[other] = index
+                return index
+        index = self.next_tool_index
+        self.next_tool_index += 1
+        for key in keys:
+            if key is not None:
+                self.tool_indexes[key] = index
+        return index
+
+    def _record_tool(self, index: int, call_id: Any, name: Any) -> None:
+        meta = self.tool_meta.setdefault(index, {"id": "", "name": ""})
+        if call_id:
+            meta["id"] = str(call_id)
+        elif not meta["id"]:
+            meta["id"] = f"call_{index}"
+        if name:
+            meta["name"] = str(name)
 
     def consume(self, event: Dict[str, Any]) -> List[str]:
         """Translate one Responses event into zero or more chat chunks."""
@@ -1299,8 +1327,15 @@ class _ResponsesToChatSSE:
             item = event.get("item") or {}
             if item.get("type") != "function_call":
                 return []
-            index = self._tool_index(item.get("call_id") or event.get("output_index"))
+            index = self._tool_index(
+                item.get("call_id"),
+                item.get("id"),
+                event.get("item_id"),
+                event.get("output_index"),
+            )
             self.finish_reason = "tool_calls"
+            self._record_tool(index, item.get("call_id"), item.get("name"))
+            self.tool_headers.add(index)
             return self._start() + [
                 self._chunk(
                     {
@@ -1327,7 +1362,11 @@ class _ResponsesToChatSSE:
             delta = event.get("delta")
             if not isinstance(delta, str) or not delta:
                 return []
-            index = self._tool_index(event.get("item_id") or event.get("output_index"))
+            index = self._tool_index(
+                event.get("item_id"),
+                event.get("call_id"),
+                event.get("output_index"),
+            )
             self.finish_reason = "tool_calls"
             return self._start() + [
                 self._chunk(
@@ -1363,10 +1402,39 @@ class _ResponsesToChatSSE:
             self.finish_reason = "tool_calls" if tool_calls else "stop"
         else:
             self.finish_reason = _bridge_finish_reason(response, tool_calls)
+        # Some upstreams only surface a function_call in the final payload;
+        # still give the chat client an id/name header for it in `finish()`.
+        for item in tool_calls:
+            index = self._tool_index(item.get("call_id"), item.get("id"))
+            self._record_tool(
+                index, item.get("call_id") or item.get("id"), item.get("name")
+            )
 
     def finish(self) -> List[str]:
         """Closing frames: finish_reason, optional usage, and [DONE]."""
         out = self._start()
+        for index in sorted(self.tool_meta):
+            if index in self.tool_headers:
+                continue
+            meta = self.tool_meta[index]
+            out.append(
+                self._chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": index,
+                                "id": meta["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": meta["name"],
+                                    "arguments": "",
+                                },
+                            }
+                        ]
+                    }
+                )
+            )
+            self.tool_headers.add(index)
         out.append(self._chunk({}, self.finish_reason or "stop"))
         if self.usage:
             out.append(sse_frame({**self._base(), "choices": [], "usage": self.usage}))
