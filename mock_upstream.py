@@ -134,17 +134,74 @@ async def chat_completions(request: Request):
     model = body.get("model", "unknown")
     now = int(time.time())
 
-    for message in body.get("messages") or []:
+    # Mirror the azure-ai/Anthropic validation of Portkey's OpenAI->Anthropic
+    # transform (verified live 2026-11-05): content parts must be objects
+    # with a `type`, and claude tool_result blocks reject OpenAI `image_url`
+    # parts. The proxy repairs these shapes before forwarding; these
+    # rejections make the integration suite fail if that repair regresses.
+    for i, message in enumerate(body.get("messages") or []):
         content = message.get("content")
-        if isinstance(content, list) and any(
-            part.get("type") in ("input_text", "output_text")
-            for part in content
-            if isinstance(part, dict)
-        ):
-            return JSONResponse(
-                status_code=400,
-                content={"error": {"message": "Chat content parts must use text, not input_text or output_text."}},
-            )
+        if not isinstance(content, list):
+            continue
+        for j, part in enumerate(content):
+            if not isinstance(part, dict):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": (
+                                f"azure-ai error: messages.{i}.content.{j}: "
+                                "Input should be an object"
+                            )
+                        }
+                    },
+                )
+            ptype = part.get("type")
+            if ptype in ("input_text", "output_text"):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": (
+                                "Chat content parts must use text, "
+                                "not input_text or output_text."
+                            )
+                        }
+                    },
+                )
+            if not ptype:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": (
+                                f"azure-ai error: messages.{i}.content.{j}.type: "
+                                "Field required"
+                            )
+                        }
+                    },
+                )
+            if (
+                message.get("role") == "tool"
+                and ptype == "image_url"
+                and any(
+                    name in model
+                    for name in ("claude", "opus", "sonnet", "fable")
+                )
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": (
+                                f"azure-ai error: messages.{i}.content.{j}."
+                                "tool_result.content: Input tag 'image_url' found "
+                                "using 'type' does not match any of the expected "
+                                "tags: ('image', 'text')"
+                            )
+                        }
+                    },
+                )
 
     has_tools = bool(body.get("tools"))
     effort = _effort_of(body)

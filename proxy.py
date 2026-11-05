@@ -139,7 +139,7 @@ from portkey_ai._vendor.openai.resources.chat.completions.completions import (
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-PROXY_VERSION = "1.8.1"
+PROXY_VERSION = "1.9.0"
 
 # --------------------------------------------------------------------------- #
 # Environment / .env loading
@@ -728,6 +728,95 @@ def _normalize_chat_sampling(alias: str, body: Dict[str, Any]) -> None:
             "model=%s: sampling not supported upstream, adjusted: %s",
             alias,
             ", ".join(dropped),
+        )
+
+
+def _anthropic_image_source(url: Any) -> Optional[Dict[str, Any]]:
+    """Build an Anthropic image `source` block from an OpenAI `image_url`.
+
+    Returns None when the URL cannot be represented (Portkey/Anthropic only
+    accept base64 and hosted-URL sources).
+    """
+    if not isinstance(url, str) or not url:
+        return None
+    if url.startswith("data:"):
+        header, _, data = url.partition(",")
+        media_type = header[len("data:") :].split(";")[0] or "image/png"
+        if "base64" in header and data:
+            return {"type": "base64", "media_type": media_type, "data": data}
+        return None
+    if url.startswith(("http://", "https://")):
+        return {"type": "url", "url": url}
+    return None
+
+
+def _normalize_message_parts(alias: str, body: Dict[str, Any]) -> None:
+    """Repair chat message content parts the upstream would reject.
+
+    Verified live against the azure-ai Anthropic deployments (2026-11-05):
+    Portkey's OpenAI->Anthropic transform passes content parts through
+    verbatim, so the upstream 400s on parts without a `type` (the Copilot
+    app replays assistant turns as `[{"text": ...}]`, producing
+    "messages.N.content.M.type: Field required"), on bare strings inside a
+    content array, and on `image_url` parts inside tool results (tool_result
+    blocks only accept Anthropic-native `image` blocks). Typeless parts are
+    invalid OpenAI shape too, so the basic repair is model-agnostic; only
+    the tool-result image rewrite is claude-only.
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return
+    provider = MODEL_REGISTRY.get(alias, {}).get("provider")
+    repaired: List[str] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        parts: List[Any] = []
+        changed = False
+        for part in content:
+            new_part: Any = part
+            if isinstance(part, str):
+                new_part = {"type": "text", "text": part}
+                changed = True
+            elif isinstance(part, dict):
+                ptype = part.get("type")
+                if not ptype:
+                    if "text" in part:
+                        new_part = {"type": "text", "text": part["text"]}
+                    elif "image_url" in part:
+                        new_part = {
+                            "type": "image_url",
+                            "image_url": part["image_url"],
+                        }
+                    else:
+                        new_part = {"type": "text", "text": json.dumps(part)}
+                    changed = True
+                elif (
+                    message.get("role") == "tool"
+                    and provider == "anthropic"
+                    and ptype == "image_url"
+                ):
+                    image = part.get("image_url")
+                    url = image.get("url") if isinstance(image, dict) else image
+                    source = _anthropic_image_source(url)
+                    if source is not None:
+                        new_part = {"type": "image", "source": source}
+                        changed = True
+            elif part is not None:
+                new_part = {"type": "text", "text": json.dumps(part)}
+                changed = True
+            parts.append(new_part)
+        if changed:
+            message["content"] = parts
+            repaired.append(f"messages[{index}]")
+    if repaired:
+        logging.info(
+            "model=%s: repaired message content parts in %s",
+            alias,
+            ", ".join(repaired),
         )
 
 
@@ -2545,6 +2634,11 @@ async def chat_completions(request: Request):
     # place, so both the direct chat call and the responses bridge below
     # send only what the upstream accepts.
     _normalize_chat_sampling(alias, body)
+
+    # Repair content parts the upstream transform rejects (typeless parts,
+    # bare strings in content arrays, image_url inside tool results on
+    # claude) before any kwargs are built from the body.
+    _normalize_message_parts(alias, body)
 
     # Forward all remaining parameters untouched (tools, tool_choice, top_k,
     # seed, response_format, ...).

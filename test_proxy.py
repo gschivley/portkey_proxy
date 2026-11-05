@@ -704,6 +704,137 @@ def main() -> int:
                 str(frames[0].get("model")),
             )
 
+        # Content-part repair: the Copilot app replays assistant turns with
+        # typeless content parts and tool results can carry image parts; the
+        # azure-ai Anthropic deployments 400 on both (verified live
+        # 2026-11-05) and the mock mirrors those rejections, so a 200 here
+        # means the proxy repaired the shape before forwarding.
+        typeless_history = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"},
+            # Copilot app replay shape: content array with a part missing
+            # "type" -> upstream "messages.2.content.0.type: Field required".
+            {"role": "assistant", "content": [{"text": "Hello!"}]},
+            {"role": "user", "content": "Continue"},
+        ]
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-opus-5-5", "messages": typeless_history},
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "repair: assistant typeless part gets type=text",
+            r.status_code == 200
+            and cap["body"]["messages"][2]["content"]
+            == [{"type": "text", "text": "Hello!"}],
+            str(cap["body"]["messages"][2].get("content")),
+        )
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-opus-5-5", "messages": typeless_history, "stream": True},
+        )
+        check(
+            "repair: assistant typeless part streams",
+            r.status_code == 200 and parse_sse(r.text),
+            r.text[:200],
+        )
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "claude-opus-5-5",
+                "messages": [
+                    {"role": "user", "content": ["bare string", {"type": "text", "text": "typed"}]},
+                    # Unknown typeless part: JSON-encoded into a text part.
+                    {"role": "assistant", "content": [{"kind": "widget"}]},
+                    {"role": "user", "content": "Continue"},
+                ],
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "repair: bare string and unknown typeless part become text parts",
+            r.status_code == 200
+            and cap["body"]["messages"][0]["content"][0]
+            == {"type": "text", "text": "bare string"}
+            and cap["body"]["messages"][1]["content"]
+            == [{"type": "text", "text": '{"kind": "widget"}'}],
+            str(cap["body"]["messages"][:2]),
+        )
+        img_png = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+            "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        )
+        tool_loop_messages = [
+            {"role": "user", "content": "check the screenshot"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "shot", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": img_png}},
+                    {"text": "screenshot attached"},
+                ],
+            },
+        ]
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-opus-5-5", "messages": tool_loop_messages},
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "repair: claude tool result image_url -> anthropic image block",
+            r.status_code == 200
+            and cap["body"]["messages"][2]["content"][0]
+            == {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": img_png.split(",", 1)[1],
+                },
+            }
+            and cap["body"]["messages"][2]["content"][1]
+            == {"type": "text", "text": "screenshot attached"},
+            str(cap["body"]["messages"][2].get("content")),
+        )
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-5.6-sol",
+                "messages": [
+                    tool_loop_messages[0],
+                    tool_loop_messages[1],
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        # Typeless part is repaired for every provider; the
+                        # image_url rewrite is claude-only, so keep it out of
+                        # this non-anthropic request.
+                        "content": [{"text": "screenshot attached"}],
+                    },
+                ],
+            },
+        )
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "repair: non-anthropic repairs typeless part",
+            r.status_code == 200
+            and cap["body"]["messages"][2]["content"]
+            == [{"type": "text", "text": "screenshot attached"}],
+            str(cap["body"]["messages"][2].get("content")),
+        )
+
         # GPT-5.6 must keep its original behaviour: reasoning stripped with tools.
         r = client.post(
             "/v1/chat/completions",
