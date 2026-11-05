@@ -489,6 +489,30 @@ replies. Copilot only acts on the OpenAI enum, so a turn that ends with
 invents a new one, so an unexpected value is visible in the log instead of
 silently swallowed.
 
+**Claude 400s: "messages.2.content.0.type: Field required"**
+
+The Copilot app replays earlier assistant turns as content arrays whose parts
+have no `type` field (`"content": [{"text": "..."}]`), and tool results can
+carry `image_url` parts (screenshots). Portkey's OpenAI→Anthropic transform
+passes content parts through verbatim, and the Azure-hosted Anthropic
+deployments reject both shapes — the first as `messages.N.content.M.type:
+Field required` (with a system prompt on top, the first replayed assistant
+turn is `messages.2`), the second as `tool_result.content: Input tag
+'image_url' ... does not match any of the expected tags`. The proxy now
+repairs message content before forwarding (v1.9.0):
+
+- parts without a `type` get one (`text` / `image_url`, or a JSON-encoded
+  text part for anything else), for every model — the shape is invalid
+  OpenAI too
+- bare strings inside a content array are wrapped as text parts
+- on the claude models, `image_url` parts inside **tool** messages become
+  Anthropic-native `image` blocks (data URIs → base64 source, http(s) → url
+  source); user-message images are untouched
+
+Repaired requests log `model=...: repaired message content parts in
+messages[N], ...`. `mock_upstream.py` mirrors the upstream rejections so the
+test suite catches a regression of this repair.
+
 **"408 Request exceeded the timeout sent in the request: 600ms"**
 
 The proxy was sending a per-request timeout of `600` to the Portkey gateway,
