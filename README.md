@@ -505,6 +505,14 @@ repairs message content before forwarding (v1.9.0):
   text part for anything else), for every model — the shape is invalid
   OpenAI too
 - bare strings inside a content array are wrapped as text parts
+- malformed assistant `content_blocks` are removed on Claude when standard
+  `content` or `tool_calls` are available. Portkey prefers this alternate
+  field over `content`, so replayed stream deltas without block types can
+  trigger the same error even when `content` is a valid string. Properly
+  typed native blocks are preserved
+- on the claude models, assistant tool-call turns with null or omitted
+  content are forwarded with `content: ""`, preserving `tool_calls`; this
+  avoids sending null content through the gateway's Anthropic conversion
 - on the claude models, `image_url` parts inside **tool** messages become
   Anthropic-native `image` blocks (data URIs → base64 source, http(s) → url
   source); user-message images are untouched

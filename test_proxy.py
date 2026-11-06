@@ -787,6 +787,49 @@ def main() -> int:
                 ],
             },
         ]
+        for stream in (False, True):
+            for omitted in (False, True):
+                assistant_turn = {
+                    **tool_loop_messages[1],
+                    "content": None,
+                    "content_blocks": [{"index": 0, "delta": {"text": ""}}],
+                }
+                if omitted:
+                    assistant_turn.pop("content")
+                r = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "claude-opus-5-5",
+                        "messages": [
+                            tool_loop_messages[0],
+                            assistant_turn,
+                            {
+                                "role": "tool",
+                                "tool_call_id": "call_1",
+                                "content": "Screenshot inspected",
+                            },
+                        ],
+                        "tools": req_body["tools"],
+                        "reasoning_effort": "high",
+                        "stream": stream,
+                    },
+                )
+                cap = json.loads(CAPTURE.read_text())
+                forwarded = cap["body"]["messages"][1]
+                frames = parse_sse(r.text) if stream else []
+                check(
+                    f"repair: claude null tool-call content (stream={stream}, omitted={omitted})",
+                    r.status_code == 200
+                    and forwarded.get("content") == ""
+                    and forwarded.get("tool_calls") == assistant_turn["tool_calls"]
+                    and "content_blocks" not in forwarded
+                    and (
+                        bool(frames) and not any("error" in frame for frame in frames)
+                        if stream
+                        else r.json().get("object") == "chat.completion"
+                    ),
+                    r.text[:200],
+                )
         r = client.post(
             "/v1/chat/completions",
             json={"model": "claude-opus-5-5", "messages": tool_loop_messages},

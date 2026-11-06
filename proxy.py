@@ -761,7 +761,11 @@ def _normalize_message_parts(alias: str, body: Dict[str, Any]) -> None:
     content array, and on `image_url` parts inside tool results (tool_result
     blocks only accept Anthropic-native `image` blocks). Typeless parts are
     invalid OpenAI shape too, so the basic repair is model-agnostic; only
-    the tool-result image rewrite is claude-only.
+    the tool-result image rewrite is claude-only. Claude assistant tool-call
+    turns with null or omitted content use an empty string instead, avoiding
+    malformed content blocks in the gateway's Anthropic conversion. Malformed
+    assistant content_blocks are discarded when standard chat fields exist,
+    because the gateway otherwise prefers them over content.
     """
     messages = body.get("messages")
     if not isinstance(messages, list):
@@ -772,6 +776,28 @@ def _normalize_message_parts(alias: str, body: Dict[str, Any]) -> None:
         if not isinstance(message, dict):
             continue
         content = message.get("content")
+        content_blocks = message.get("content_blocks")
+        if (
+            provider == "anthropic"
+            and message.get("role") == "assistant"
+            and isinstance(content_blocks, list)
+            and any(
+                not isinstance(block, dict) or not block.get("type")
+                for block in content_blocks
+            )
+            and (content is not None or message.get("tool_calls"))
+        ):
+            del message["content_blocks"]
+            repaired.append(f"messages[{index}].content_blocks")
+        if (
+            provider == "anthropic"
+            and message.get("role") == "assistant"
+            and content is None
+            and message.get("tool_calls")
+        ):
+            message["content"] = ""
+            repaired.append(f"messages[{index}]")
+            continue
         if not isinstance(content, list):
             continue
         parts: List[Any] = []
@@ -2512,6 +2538,45 @@ async def _validated_request(
     return client, model, entry["upstream"], body
 
 
+def _message_content_shapes(kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Describe rejected message structure without recording conversation content."""
+    messages = kwargs.get("messages")
+    if not isinstance(messages, list):
+        return []
+    shapes: List[Dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        shape: Dict[str, Any] = {"index": index}
+        if isinstance(message, dict):
+            content = message.get("content")
+            shape["content_kind"] = type(content).__name__
+            shape["has_tool_calls"] = bool(message.get("tool_calls"))
+            if "content_blocks" in message:
+                blocks = message["content_blocks"]
+                shape["content_blocks_kind"] = type(blocks).__name__
+                if isinstance(blocks, list):
+                    shape["content_blocks_have_type"] = [
+                        isinstance(block, dict) and bool(block.get("type"))
+                        for block in blocks
+                    ]
+            parts = content if isinstance(content, list) else [content]
+            shape["parts"] = [
+                {
+                    "kind": type(part).__name__,
+                    "has_type": bool(part.get("type")),
+                    "has_text": "text" in part,
+                    "has_image_url": "image_url" in part,
+                    "has_source": "source" in part,
+                }
+                if isinstance(part, dict)
+                else {"kind": type(part).__name__}
+                for part in parts
+            ]
+        else:
+            shape["message_kind"] = type(message).__name__
+        shapes.append(shape)
+    return shapes
+
+
 def _sse_stream(
     client: Portkey,
     upstream: str,
@@ -2558,6 +2623,12 @@ def _sse_stream(
             logging.exception("Upstream stream failed (status=%s)", status)
         else:
             logging.warning("Upstream stream failed (status=%s): %s", status, message)
+        if status == 400 and re.search(r"messages\.\d+\.content", message):
+            logging.warning(
+                "model=%s: rejected message content shapes (no content): %s",
+                alias,
+                json.dumps(_message_content_shapes(attempts[0])),
+            )
         yield sse_frame(
             {"error": _error_payload(message, err_type, code, param)["error"]}
         )

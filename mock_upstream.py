@@ -141,6 +141,8 @@ async def chat_completions(request: Request):
     # rejections make the integration suite fail if that repair regresses.
     for i, message in enumerate(body.get("messages") or []):
         content = message.get("content")
+        if message.get("role") == "assistant" and message.get("content_blocks") is not None:
+            content = message["content_blocks"]
         if not isinstance(content, list):
             continue
         for j, part in enumerate(content):
