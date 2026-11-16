@@ -64,16 +64,15 @@ Configuration (local .env file next to this script, or environment):
                            GPT-5.6 family, which keeps reasoning intact; "never"
                            forwards the upstream 400 instead. Needs
                            RESPONSES_ENABLED=1.
-    GPT56_SOL_UPSTREAM_MODEL     optional upstream model for gpt-5.6-sol
-    GPT56_TERRA_UPSTREAM_MODEL   optional upstream model for gpt-5.6-terra
     GPT6_ASTRA_UPSTREAM_MODEL    optional upstream model for gpt-6-astra
     GPT6_SOL_UPSTREAM_MODEL      optional upstream model for gpt-6.1-sol
+    GPT61_TERRA_UPSTREAM_MODEL   optional upstream model for gpt-6.1-terra
     GPT6_LUNA_UPSTREAM_MODEL     optional upstream model for gpt-6-luna
     GEMINI38_FLASH_UPSTREAM_MODEL  optional upstream model for gemini-3.8-flash
     GEMINI4_ARGON_UPSTREAM_MODEL   optional upstream model for gemini-4-argon
     CLAUDE_OPUS_55_UPSTREAM_MODEL     optional upstream model for claude-opus-5-5
     CLAUDE_SONNET_55_UPSTREAM_MODEL   optional upstream model for claude-sonnet-5-5
-    CLAUDE_FABLE_51_UPSTREAM_MODEL    optional upstream model for claude-fable-5-1
+    CLAUDE_FABLE_52_UPSTREAM_MODEL    optional upstream model for claude-fable-5-2
     GPT6_ASTRA_REASONING_EFFORTS   comma-separated reasoning_effort values the
                            upstream accepts for gpt-6-astra (default
                            low,medium,high,xhigh — 'none' is rejected there)
@@ -81,7 +80,7 @@ Configuration (local .env file next to this script, or environment):
     GEMINI4_ARGON_REASONING_EFFORTS
     CLAUDE_OPUS_55_REASONING_EFFORTS
     CLAUDE_SONNET_55_REASONING_EFFORTS
-    CLAUDE_FABLE_51_REASONING_EFFORTS
+    CLAUDE_FABLE_52_REASONING_EFFORTS
                            comma-separated accepted reasoning_effort values
                            for those models (default: unset, so whatever
                            the client sends is forwarded untouched)
@@ -96,6 +95,9 @@ Configuration (local .env file next to this script, or environment):
     GPT6_SOL_PRICING_MODEL pricing-catalog model name for gpt-6.1-sol
                            (default gpt-6-sol — the catalog has no entry under
                            the deployment name)
+    GPT61_TERRA_PRICING_MODEL  pricing-catalog model name for gpt-6.1-terra
+                           (default gpt-6.1-terra, the catalog's own entry; the
+                           deployment name is already the catalog name)
 
 Usage & cost tracking (see usage.py; GET /v1/usage, or run usage_report.py):
     USAGE_TRACKING       "0" to disable recording usage/cost (default on)
@@ -262,10 +264,10 @@ DEFAULT_REASONING_EFFORT = _parse_default_effort(
 # --------------------------------------------------------------------------- #
 # Model registry
 # --------------------------------------------------------------------------- #
-# "gpt-5.6-sol" / "gpt-5.6-terra" are the names the Copilot app will use.
-# They are passed to Portkey as-is (they may be Portkey deployment aliases).
-# To route them to a different upstream model, set e.g.
-#   GPT56_SOL_UPSTREAM_MODEL=claude-sonnet-5-5
+# These aliases are the names the Copilot app will use. They are passed to
+# Portkey as-is (they may be Portkey deployment aliases). To route one to a
+# different upstream model, set e.g.
+#   GPT61_TERRA_UPSTREAM_MODEL=claude-sonnet-5-5
 # or edit "upstream" below.
 #
 # Each model also declares a reasoning profile: upstreams disagree about
@@ -313,32 +315,6 @@ REASONING_PROFILES: Dict[str, Dict[str, Any]] = {
 }
 
 MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
-    "gpt-5.6-sol": {
-        "upstream": os.environ.get("GPT56_SOL_UPSTREAM_MODEL", "gpt-5.6-sol"),
-        "description": "Portkey/AI Sandbox model exposed to the Copilot app",
-        "reasoning": "gpt-5.6",
-        "default_effort": _parse_default_effort(
-            os.environ.get("GPT56_SOL_DEFAULT_REASONING_EFFORT"),
-            DEFAULT_REASONING_EFFORT,
-        ),
-        "provider": "openai",
-        # Every gpt deployment rejects sampling knobs outright (only the
-        # default temperature is accepted, top_p/stop/penalties 400, and
-        # max_tokens must be spelled max_completion_tokens) — see
-        # CHAT_SAMPLING_DROPS. Flagged so they are dropped, not 400s.
-        "sampling": False,
-    },
-    "gpt-5.6-terra": {
-        "upstream": os.environ.get("GPT56_TERRA_UPSTREAM_MODEL", "gpt-5.6-terra"),
-        "description": "Portkey/AI Sandbox model exposed to the Copilot app",
-        "reasoning": "gpt-5.6",
-        "default_effort": _parse_default_effort(
-            os.environ.get("GPT56_TERRA_DEFAULT_REASONING_EFFORT"),
-            DEFAULT_REASONING_EFFORT,
-        ),
-        "provider": "openai",
-        "sampling": False,
-    },
     # Named gpt-6 but behaves like the GPT-5.6 family (verified live 2026-10-02):
     # it accepts reasoning_effort="none" (astra/6.1-sol reject it) and takes
     # function tools on /v1/chat/completions once reasoning is set to "none",
@@ -381,6 +357,22 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         # The pricing catalog lists this deployment as "gpt-6-sol"; looking it
         # up under the request name 404s and the call is logged without a cost.
         "pricing_model": os.environ.get("GPT6_SOL_PRICING_MODEL", "gpt-6-sol"),
+    },
+    "gpt-6.1-terra": {
+        "upstream": os.environ.get("GPT61_TERRA_UPSTREAM_MODEL", "gpt-6.1-terra"),
+        "description": "Portkey/AI Sandbox model exposed to the Copilot app",
+        "reasoning": "gpt-6",
+        "efforts_env": "GPT61_TERRA_REASONING_EFFORTS",
+        "default_effort": _parse_default_effort(
+            os.environ.get("GPT61_TERRA_DEFAULT_REASONING_EFFORT"),
+            DEFAULT_REASONING_EFFORT,
+        ),
+        "provider": "openai",
+        "sampling": False,
+        # The pricing catalog lists this deployment under its own name
+        # (verified against the public pricing API 2026-11-16); the older
+        # "gpt-6-terra" name 404s, so it must not be used as the default.
+        "pricing_model": os.environ.get("GPT61_TERRA_PRICING_MODEL", "gpt-6.1-terra"),
     },
     "gemini-3.8-flash": {
         "upstream": os.environ.get("GEMINI38_FLASH_UPSTREAM_MODEL", "gemini-3.8-flash"),
@@ -436,15 +428,15 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
         "provider": "anthropic",
     },
-    "claude-fable-5-1": {
+    "claude-fable-5-2": {
         "upstream": os.environ.get(
-            "CLAUDE_FABLE_51_UPSTREAM_MODEL", "claude-fable-5-1"
+            "CLAUDE_FABLE_52_UPSTREAM_MODEL", "claude-fable-5-2"
         ),
-        "description": "Anthropic Claude Fable 5.1 via the AI Sandbox",
+        "description": "Anthropic Claude Fable 5.2 via the AI Sandbox",
         "reasoning": "flexible",
-        "efforts_env": "CLAUDE_FABLE_51_REASONING_EFFORTS",
+        "efforts_env": "CLAUDE_FABLE_52_REASONING_EFFORTS",
         "default_effort": _parse_default_effort(
-            os.environ.get("CLAUDE_FABLE_51_DEFAULT_REASONING_EFFORT"),
+            os.environ.get("CLAUDE_FABLE_52_DEFAULT_REASONING_EFFORT"),
             DEFAULT_REASONING_EFFORT,
         ),
         "provider": "anthropic",
@@ -3242,7 +3234,7 @@ def main() -> None:
     print("   export COPILOT_PROVIDER_TYPE=openai")
     print(f"   export COPILOT_PROVIDER_BASE_URL=http://{args.host}:{args.port}/v1")
     print("   export COPILOT_PROVIDER_API_KEY=<your Portkey / AI Sandbox key>")
-    print("   export COPILOT_MODEL=gpt-5.6-sol")
+    print("   export COPILOT_MODEL=gpt-6.1-sol")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
