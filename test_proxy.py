@@ -5,18 +5,19 @@ End-to-end integration test for proxy.py.
 Boots a mock Portkey-compatible upstream (mock_upstream.py) and the real
 proxy (proxy.py) as subprocesses, then verifies:
 
-  - model listing (gpt-5.6-sol / gpt-5.6-terra / gpt-6-luna)
+  - model listing (gpt-6.1-sol / gpt-6.1-terra / gpt-6-luna)
   - non-streaming chat completions (JSON shape, alias -> upstream rewrite,
     auth injection, parameter forwarding, usage metadata)
   - streaming chat completions (SSE chunks, [DONE], final usage)
   - error translation (unknown model, missing model, upstream 401, bad JSON)
   - per-request API keys (Copilot app style Authorization: Bearer ...),
     x-portkey-api-key passthrough, and 401 when no key is available
-  - per-model reasoning handling: GPT-5.6 strips reasoning with tools and
-    auto-retries with reasoning_effort="none"; gpt-6-astra keeps tools+reasoning
+  - per-model reasoning handling: the GPT-5.6 profile (gpt-6-luna) strips
+    reasoning with tools and auto-retries with reasoning_effort="none";
+    gpt-6-astra keeps tools+reasoning
     but rewrites unsupported values (e.g. "none" -> "low", or via a configured
     vocabulary); gemini-3.8-flash forwards effort values untouched; the
-    claude-opus-5-5 / claude-sonnet-5-5 / claude-fable-5-1 aliases use the same
+    claude-opus-5-5 / claude-sonnet-5-5 / claude-fable-5-2 aliases use the same
     flexible profile
   - usage & cost tracking (usage.py): JSONL records for stream + non-stream
     calls with costs from the (mocked) pricing API, cached-token split,
@@ -122,14 +123,14 @@ def main() -> int:
         {
             "PORTKEY_API_KEY": "sk-portkey-test",
             "PORTKEY_BASE_URL": f"http://127.0.0.1:{mock_port}",  # no /v1: proxy must normalize
-            "GPT56_SOL_UPSTREAM_MODEL": "upstream-sol",
-            "GPT56_TERRA_UPSTREAM_MODEL": "upstream-terra",
+            "GPT6_SOL_UPSTREAM_MODEL": "upstream-sol",
+            "GPT61_TERRA_UPSTREAM_MODEL": "upstream-terra",
             "GPT6_LUNA_UPSTREAM_MODEL": "upstream-luna",
             "GPT6_ASTRA_UPSTREAM_MODEL": "upstream-astra",
             "GEMINI38_FLASH_UPSTREAM_MODEL": "upstream-gemini",
             "CLAUDE_OPUS_55_UPSTREAM_MODEL": "upstream-opus",
             "CLAUDE_SONNET_55_UPSTREAM_MODEL": "upstream-sonnet",
-            "CLAUDE_FABLE_51_UPSTREAM_MODEL": "upstream-fable",
+            "CLAUDE_FABLE_52_UPSTREAM_MODEL": "upstream-fable",
             "INCLUDE_STREAM_USAGE": "1",
             # Blank the NRP key so a developer's real .env / shell export can
             # never leak into the default proxies (section 10 sets its own).
@@ -163,17 +164,25 @@ def main() -> int:
         check(
             "v1/models lists all models",
             r.status_code == 200
-            and "gpt-5.6-sol" in ids
-            and "gpt-5.6-terra" in ids
             and "gpt-6-luna" in ids
             and "gpt-6-astra" in ids
             and "gpt-6.1-sol" in ids
+            and "gpt-6.1-terra" in ids
             and "gemini-3.8-flash" in ids
             and "gemini-4-argon" in ids
             and "claude-opus-5-5" in ids
             and "claude-sonnet-5-5" in ids
-            and "claude-fable-5-1" in ids,
+            and "claude-fable-5-2" in ids,
             str(r.json()),
+        )
+        # Aliases retired in favour of gpt-6.1-terra / claude-fable-5-2.
+        # They must behave like any unknown model: absent from the listing and
+        # 404 model_not_found on both wire APIs (asserted in section 4).
+        retired_aliases = ["gpt-5.6-sol", "gpt-5.6-terra", "claude-fable-5-1"]
+        check(
+            "v1/models omits retired aliases",
+            not any(alias in ids for alias in retired_aliases),
+            str([alias for alias in retired_aliases if alias in ids]),
         )
         r = client.get("/models")
         check("bare /models also works", r.status_code == 200)
@@ -186,7 +195,7 @@ def main() -> int:
 
         # 2. Non-streaming -------------------------------------------------
         req_body = {
-            "model": "gpt-5.6-sol",
+            "model": "gpt-6-luna",
             "messages": [{"role": "user", "content": "Hi there"}],
             "temperature": 0.7,
             "tools": [
@@ -206,7 +215,7 @@ def main() -> int:
         check("non-stream object", j.get("object") == "chat.completion", str(j))
         check(
             "non-stream client-facing model",
-            j.get("model") == "gpt-5.6-sol",
+            j.get("model") == "gpt-6-luna",
             str(j.get("model")),
         )
         check(
@@ -224,7 +233,7 @@ def main() -> int:
         cap = json.loads(CAPTURE.read_text())
         check(
             "upstream got rewritten model",
-            cap["body"].get("model") == "upstream-sol",
+            cap["body"].get("model") == "upstream-luna",
             str(cap["body"].get("model")),
         )
         # The portkey_ai SDK authenticates via the x-portkey-api-key header.
@@ -394,7 +403,7 @@ def main() -> int:
         r = client.post(
             "/v1/chat/completions",
             json={
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-luna",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "reasoning_effort": "high",
             },
@@ -659,7 +668,7 @@ def main() -> int:
         for alias, upstream_name in (
             ("claude-opus-5-5", "upstream-opus"),
             ("claude-sonnet-5-5", "upstream-sonnet"),
-            ("claude-fable-5-1", "upstream-fable"),
+            ("claude-fable-5-2", "upstream-fable"),
         ):
             claude_body = {
                 "model": alias,
@@ -854,7 +863,7 @@ def main() -> int:
         r = client.post(
             "/v1/chat/completions",
             json={
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6.1-sol",
                 "messages": [
                     tool_loop_messages[0],
                     tool_loop_messages[1],
@@ -878,24 +887,25 @@ def main() -> int:
             str(cap["body"]["messages"][2].get("content")),
         )
 
-        # GPT-5.6 must keep its original behaviour: reasoning stripped with tools.
+        # The GPT-5.6 profile must keep its original behaviour: reasoning is
+        # stripped with tools.
         r = client.post(
             "/v1/chat/completions",
-            json={**astra_body, "model": "gpt-5.6-sol", "reasoning_effort": "high"},
+            json={**astra_body, "model": "gpt-6-luna", "reasoning_effort": "high"},
         )
         cap = json.loads(CAPTURE.read_text())
         check(
-            "gpt-5.6: still strips reasoning with tools",
+            "gpt-5.6 profile: still strips reasoning with tools",
             r.status_code == 200 and "reasoning_effort" not in cap["body"],
             str(cap["body"].get("reasoning_effort")),
         )
 
         # Default reasoning_effort="medium" when client omits reasoning:
-        # 1) Chat completions without tools on gpt-5.6-sol -> reasoning_effort="medium"
+        # 1) Chat completions without tools on gpt-6-luna -> reasoning_effort="medium"
         r = client.post(
             "/v1/chat/completions",
             json={
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-luna",
                 "messages": [{"role": "user", "content": "Hi"}],
             },
         )
@@ -1008,7 +1018,7 @@ def main() -> int:
         )
         check(
             "stream chunk model is alias",
-            frames[0].get("model") == "gpt-5.6-sol",
+            frames[0].get("model") == "gpt-6-luna",
             str(frames[0].get("model")),
         )
         usage_frames = [f for f in frames if f.get("usage")]
@@ -1020,7 +1030,7 @@ def main() -> int:
         cap = json.loads(CAPTURE.read_text())
         check(
             "stream upsteam model rewritten",
-            cap["body"].get("model") == "upstream-sol",
+            cap["body"].get("model") == "upstream-luna",
             str(cap["body"].get("model")),
         )
         check(
@@ -1112,7 +1122,7 @@ def main() -> int:
 
         r = client.post(
             "/v1/chat/completions",
-            json={"model": "gpt-5.6-terra", "messages": [], "fail": "auth"},
+            json={"model": "gpt-6.1-terra", "messages": [], "fail": "auth"},
         )
         check(
             "upstream 401 -> 401 with OpenAI error",
@@ -1129,6 +1139,27 @@ def main() -> int:
         check(
             "invalid JSON -> 400", r.status_code == 400 and "error" in r.json(), r.text
         )
+
+        # Retired aliases must reject exactly like any unknown model (on both
+        # wire APIs). Their names come from `retired_aliases`, built in the
+        # model-listing section.
+        for removed in retired_aliases:
+            r = client.post(
+                "/v1/chat/completions", json={"model": removed, "messages": []}
+            )
+            check(
+                f"retired alias {removed} -> chat 404 model_not_found",
+                r.status_code == 404
+                and r.json().get("error", {}).get("code") == "model_not_found",
+                r.text,
+            )
+            r = client.post("/v1/responses", json={"model": removed, "input": "x"})
+            check(
+                f"retired alias {removed} -> responses 404 model_not_found",
+                r.status_code == 404
+                and r.json().get("error", {}).get("code") == "model_not_found",
+                r.text,
+            )
 
         # (/v1/responses is a real endpoint — covered in section 7.)
 
@@ -1177,7 +1208,7 @@ def main() -> int:
                 "DEFAULT_REASONING_EFFORT": "off",
                 "CLAUDE_OPUS_55_DEFAULT_REASONING_EFFORT": "low",
                 "CLAUDE_SONNET_55_DEFAULT_REASONING_EFFORT": "0",
-                "CLAUDE_FABLE_51_DEFAULT_REASONING_EFFORT": "none",
+                "CLAUDE_FABLE_52_DEFAULT_REASONING_EFFORT": "none",
             }
         )
         proxy2_log = open(ROOT / "_proxy2.log", "w")
@@ -1287,10 +1318,10 @@ def main() -> int:
         )
 
         for alias, expected in (
-            ("gpt-5.6-sol", None),
+            ("gpt-6.1-terra", None),
             ("claude-opus-5-5", "low"),
             ("claude-sonnet-5-5", None),
-            ("claude-fable-5-1", "none"),
+            ("claude-fable-5-2", "none"),
         ):
             for route, input_body in (
                 ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}]}),
@@ -1316,7 +1347,7 @@ def main() -> int:
         # 7. Responses API (/v1/responses) --------------------------------
         # Responses-native request: nested reasoning, FLAT function tools.
         resp_body = {
-            "model": "gpt-5.6-sol",
+            "model": "gpt-6-luna",
             "input": "Hi there",
             "reasoning": {"effort": "medium"},
             "tools": [
@@ -1338,7 +1369,7 @@ def main() -> int:
         check("responses non-stream object", j.get("object") == "response", str(j))
         check(
             "responses client-facing model",
-            j.get("model") == "gpt-5.6-sol",
+            j.get("model") == "gpt-6-luna",
             str(j.get("model")),
         )
         check(
@@ -1356,7 +1387,7 @@ def main() -> int:
         cap = json.loads(CAPTURE.read_text())
         check(
             "responses model rewritten upstream",
-            cap["body"].get("model") == "upstream-sol",
+            cap["body"].get("model") == "upstream-luna",
             str(cap["body"].get("model")),
         )
         check(
@@ -1426,7 +1457,7 @@ def main() -> int:
         # the nested shape the Responses API reads.
         r = client.post(
             "/v1/responses",
-            json={"model": "gpt-5.6-terra", "input": "Hi", "reasoning_effort": "high"},
+            json={"model": "gpt-6.1-terra", "input": "Hi", "reasoning_effort": "high"},
         )
         cap = json.loads(CAPTURE.read_text())
         check(
@@ -1442,7 +1473,7 @@ def main() -> int:
         r = client.post(
             "/v1/responses",
             json={
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6.1-terra",
                 "messages": [
                     {"role": "system", "content": "Be brief."},
                     {"role": "user", "content": "Hi"},
@@ -1463,7 +1494,7 @@ def main() -> int:
         r = client.post(
             "/v1/responses",
             json={
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6.1-terra",
                 "messages": [
                     {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
                 ],
@@ -1481,7 +1512,7 @@ def main() -> int:
         r = client.post(
             "/v1/responses",
             json={
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6.1-terra",
                 "input": "native",
                 "messages": [{"role": "user", "content": "chat"}],
             },
@@ -1561,7 +1592,7 @@ def main() -> int:
         )
         check(
             "responses stream rewrites model to alias",
-            completed and completed[0]["response"].get("model") == "gpt-5.6-sol",
+            completed and completed[0]["response"].get("model") == "gpt-6-luna",
             str(completed),
         )
         usage_frames = [
@@ -1595,7 +1626,7 @@ def main() -> int:
         cap = json.loads(CAPTURE.read_text())
         check(
             "responses stream forwarded upstream with model rewrite",
-            cap["body"].get("model") == "upstream-sol",
+            cap["body"].get("model") == "upstream-luna",
             str(cap["body"].get("model")),
         )
 
@@ -1614,7 +1645,7 @@ def main() -> int:
         )
         r = client.post(
             "/v1/responses",
-            json={"model": "gpt-5.6-sol", "input": "x", "fail": "auth"},
+            json={"model": "gpt-6.1-sol", "input": "x", "fail": "auth"},
         )
         check(
             "responses upstream 401 -> 401 OpenAI error",
@@ -1976,19 +2007,19 @@ def main() -> int:
         r = client3.post(
             "/v1/chat/completions",
             json={
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6.1-terra",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "mock_cached_tokens": 4,
             },
         )
         check("usage: non-stream request ok", r.status_code == 200, r.text)
-        sol = [x for x in usage_records() if x["model"] == "gpt-5.6-sol"]
-        check("usage: one non-stream record", len(sol) == 1, str(len(sol)))
-        if sol:
-            s = sol[0]
+        terra = [x for x in usage_records() if x["model"] == "gpt-6.1-terra"]
+        check("usage: one non-stream record", len(terra) == 1, str(len(terra)))
+        if terra:
+            s = terra[0]
             check(
                 "usage: record identifies model/provider",
-                s["upstream"] == "upstream-sol"
+                s["upstream"] == "upstream-terra"
                 and s["provider"] == "openai"
                 and s["stream"] is False,
                 str(s),
@@ -2010,38 +2041,52 @@ def main() -> int:
                 bool(s.get("rates")) and s["rates"]["input"] == 0.0004,
                 str(s.get("rates")),
             )
+            # gpt-6.1-terra is priced under its own catalog name (verified
+            # against the public pricing API; the legacy "gpt-6-terra" name
+            # 404s, which would leave cost_usd null).
+            check(
+                "usage: gpt-6.1-terra priced under its catalog name",
+                s["pricing_model"] == "gpt-6.1-terra",
+                str(s.get("pricing_model")),
+            )
 
         # Streaming: usage captured from the final SSE chunk.
         mock_nosplit = (12 * 0.0004 + 8 * 0.002) / 100
         r = client3.post(
             "/v1/chat/completions",
             json={
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6.1-sol",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True,
             },
         )
         check("usage: stream request ok", r.status_code == 200, r.text)
-        terr = [x for x in usage_records() if x["model"] == "gpt-5.6-terra"]
+        sol = [x for x in usage_records() if x["model"] == "gpt-6.1-sol"]
         check(
             "usage: stream record from final usage chunk",
-            len(terr) == 1
-            and terr[0]["stream"] is True
-            and terr[0]["cost_usd"] is not None
-            and abs(terr[0]["cost_usd"] - mock_nosplit) < 1e-9,
-            str(terr),
+            len(sol) == 1
+            and sol[0]["stream"] is True
+            and sol[0]["cost_usd"] is not None
+            and abs(sol[0]["cost_usd"] - mock_nosplit) < 1e-9,
+            str(sol),
+        )
+        # gpt-6.1-sol bills under its own "gpt-6.1-sol" catalog entry.
+        check(
+            "usage: gpt-6.1-sol priced under gpt-6.1-sol catalog name",
+            bool(sol) and sol[0]["pricing_model"] == "gpt-6.1-sol",
+            str(sol[0].get("pricing_model") if sol else None),
         )
 
         # Unknown pricing: request succeeds, cost stored as null.
         r = client3.post(
             "/v1/chat/completions",
             json={
-                "model": "claude-fable-5-1",
+                "model": "claude-fable-5-2",
                 "messages": [{"role": "user", "content": "Hi"}],
             },
         )
         check("usage: unpriced model request ok", r.status_code == 200, r.text)
-        fab = [x for x in usage_records() if x["model"] == "claude-fable-5-1"]
+        fab = [x for x in usage_records() if x["model"] == "claude-fable-5-2"]
         check(
             "usage: unpriced model recorded with cost null",
             len(fab) == 1 and fab[0]["cost_usd"] is None,
@@ -2097,27 +2142,6 @@ def main() -> int:
                 str(ln.get("cost_usd")),
             )
 
-        # gpt-6.1-sol is priced under its catalog name (the deployment name
-        # 404s upstream, which previously left cost_usd null).
-        r = client3.post(
-            "/v1/chat/completions",
-            json={
-                "model": "gpt-6.1-sol",
-                "messages": [{"role": "user", "content": "Hi"}],
-            },
-        )
-        check("usage: gpt-6.1-sol request ok", r.status_code == 200, r.text)
-        s61 = [x for x in usage_records() if x["model"] == "gpt-6.1-sol"]
-        mock_61 = (12 * 0.0004 + 8 * 0.002) / 100
-        check(
-            "usage: gpt-6.1-sol priced under gpt-6-sol catalog name",
-            len(s61) == 1
-            and s61[0]["pricing_model"] == "gpt-6-sol"
-            and s61[0]["cost_usd"] is not None
-            and abs(s61[0]["cost_usd"] - mock_61) < 1e-9,
-            str(s61),
-        )
-
         # Cache-write tokens are a priced subset of the input: plain input,
         # cache-write and cache-read are each billed at their own rate.
         r = client3.post(
@@ -2147,17 +2171,15 @@ def main() -> int:
             str(cw[0].get("rates")),
         )
 
-        # GET /v1/usage and /usage aggregation (seed + 7 tracked requests).
-        spent = (
-            49.9999 + mock_in + mock_nosplit + mock_gem + mock_in + mock_61 + mock_cw
-        )
+        # GET /v1/usage and /usage aggregation (seed + 6 tracked requests).
+        spent = 49.9999 + mock_in + mock_nosplit + mock_gem + mock_in + mock_cw
         r = client3.get("/v1/usage")
         rep = r.json() if r.status_code == 200 else {}
         check("usage: GET /v1/usage -> 200", r.status_code == 200, r.text)
         check(
             "usage: month, request count and spend",
             rep.get("month") == month_now
-            and rep.get("requests") == 8
+            and rep.get("requests") == 7
             and abs(rep.get("spent_usd", 0) - spent) < 1e-6,
             str(rep),
         )
@@ -2173,12 +2195,11 @@ def main() -> int:
             {m["model"] for m in rep.get("models", [])}
             == {
                 "seed-model",
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-6-luna",
+                "gpt-6.1-terra",
                 "gpt-6.1-sol",
+                "gpt-6-luna",
                 "gpt-6-astra",
-                "claude-fable-5-1",
+                "claude-fable-5-2",
                 "gemini-3.8-flash",
             },
             str(rep.get("models")),
@@ -2191,7 +2212,7 @@ def main() -> int:
         r = client3.get("/usage")
         check(
             "usage: bare /usage aggregates the same",
-            r.status_code == 200 and r.json().get("requests") == 8,
+            r.status_code == 200 and r.json().get("requests") == 7,
             r.text,
         )
         r = client3.get("/v1/usage", params={"month": "2020-01"})
@@ -2227,7 +2248,8 @@ def main() -> int:
             cache = {}
         check(
             "usage: pricing cache populated (incl. negative)",
-            "openai/upstream-sol" in cache
+            "openai/gpt-6.1-sol" in cache
+            and "openai/gpt-6.1-terra" in cache
             and (cache.get("anthropic/upstream-fable") or {}).get("rates") == {},
             str(sorted(cache)),
         )
@@ -2238,25 +2260,25 @@ def main() -> int:
         # block recorded 117 claude-opus-5-5 requests as 0 tokens / $0.00.
         # The mock now mirrors that shape, so a streaming /v1/responses request
         # must log the final counts exactly once.
-        before_sol = len([x for x in usage_records() if x["model"] == "gpt-5.6-sol"])
+        before_luna = len([x for x in usage_records() if x["model"] == "gpt-6-luna"])
         r = client3.post(
             "/v1/responses",
-            json={"model": "gpt-5.6-sol", "input": "Hi", "stream": True},
+            json={"model": "gpt-6-luna", "input": "Hi", "stream": True},
         )
         check("usage: responses stream ok", r.status_code == 200, r.text[:200])
-        sol = [x for x in usage_records() if x["model"] == "gpt-5.6-sol"]
-        mock_sol_stream = (12 * 0.0004 + 8 * 0.002) / 100
+        luna = [x for x in usage_records() if x["model"] == "gpt-6-luna"]
+        mock_luna_stream = (12 * 0.0004 + 8 * 0.002) / 100
         check(
             "usage: responses stream logs one record with the final counts",
-            len(sol) == before_sol + 1
-            and sol[-1]["stream"] is True
-            and sol[-1]["prompt_tokens"] == 12
-            and sol[-1]["completion_tokens"] == 8
-            and sol[-1]["total_tokens"] == 20
-            and sol[-1]["tokens_reported"] is True
-            and sol[-1]["cost_usd"] is not None
-            and abs(sol[-1]["cost_usd"] - mock_sol_stream) < 1e-9,
-            str(sol[-1] if sol else None),
+            len(luna) == before_luna + 1
+            and luna[-1]["stream"] is True
+            and luna[-1]["prompt_tokens"] == 12
+            and luna[-1]["completion_tokens"] == 8
+            and luna[-1]["total_tokens"] == 20
+            and luna[-1]["tokens_reported"] is True
+            and luna[-1]["cost_usd"] is not None
+            and abs(luna[-1]["cost_usd"] - mock_luna_stream) < 1e-9,
+            str(luna[-1] if luna else None),
         )
 
         # The other upstream shape (OpenAI sends `usage: null` on the opening
@@ -2264,13 +2286,13 @@ def main() -> int:
         r = client3.post(
             "/v1/responses",
             json={
-                "model": "gpt-5.6-terra",
+                "model": "gpt-6.1-terra",
                 "input": "Hi",
                 "stream": True,
                 "mock_usage_placeholder": False,
             },
         )
-        terra = [x for x in usage_records() if x["model"] == "gpt-5.6-terra"]
+        terra = [x for x in usage_records() if x["model"] == "gpt-6.1-terra"]
         check(
             "usage: responses stream with null placeholders still tracked",
             r.status_code == 200
@@ -2315,7 +2337,7 @@ def main() -> int:
         rep = client3.get("/v1/usage").json()
         check(
             "usage: aggregate still counts every tracked request",
-            rep.get("requests") == 11,
+            rep.get("requests") == 10,
             str(rep.get("requests")),
         )
         check(
@@ -2732,7 +2754,7 @@ def main() -> int:
         # --- missing NRP key on the dedicated proxy: 401 path ------------
         r = client4.post(
             "/v1/responses",
-            json={"model": "gpt-5.6-sol", "input": "Hi"},
+            json={"model": "gpt-6.1-sol", "input": "Hi"},
         )
         check(
             "nrp proxy: portkey models still work",

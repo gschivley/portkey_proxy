@@ -19,7 +19,7 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the full integration test suite (267 checks; boots a mock upstream + the real proxy)
+# Run the full integration test suite (283 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -128,9 +128,10 @@ pip install -r requirements.txt
   translated **back** into `chat.completion` / chat SSE by
   `_chat_to_responses_kwargs`, `_responses_to_chat_completion` and
   `_ResponsesToChatSSE`, so the client never knows. `auto` bridges only models
-  with `tools_on_chat: False` (the `gpt-6` profile — `gpt-6-astra` and
-  `gpt-6.1-sol` — which reject tools on chat in every shape; note `gpt-6-luna`
-  is named like this family but uses the `gpt-5.6` profile and is not bridged);
+  with `tools_on_chat: False` (the `gpt-6` profile — `gpt-6-astra`,
+  `gpt-6.1-sol` and `gpt-6.1-terra` — which reject tools on chat in every
+  shape; note `gpt-6-luna` is named like this family but uses the `gpt-5.6`
+  profile and is not bridged);
   `always` also bridges GPT-5.6 (preserving its reasoning);
   `never` forwards the upstream 400. Requires `RESPONSES_ENABLED=1`. Log line:
   `chat request bridged via responses: ...`.
@@ -151,13 +152,13 @@ pip install -r requirements.txt
   reports usage on `response.completed` regardless. `mock_upstream.py` mirrors
   this rejection so the suite catches regressions.
 - **Model aliases vs upstream models**: `MODEL_REGISTRY` maps the names Copilot
-  requests (e.g. `gpt-5.6-sol`) to upstream deployment names. Each alias can be
+  requests (e.g. `gpt-6.1-sol`) to upstream deployment names. Each alias can be
   overridden with `*_UPSTREAM_MODEL` env vars. Add new models to `MODEL_REGISTRY`
   (and the README table). Each entry also declares a `provider` (`openai`/
   `anthropic`/`google`) used for the pricing lookup; if the deployment's pricing
   name differs from its `upstream`, set a `pricing_model` (e.g. `gemini-3.8-flash`
-  -> `gemini-3.8-flash-gt-128k`, `gpt-6.1-sol` -> `gpt-6-sol`; both 404 under
-  their deployment name and would otherwise log `cost_usd: null`).
+  -> `gemini-3.8-flash-gt-128k`, which 404s under its deployment name and
+  would otherwise log `cost_usd: null`).
 - **Reasoning is per-model, not global**: `REASONING_PROFILES` captures three
   upstream quirks:
   - `gpt-5.6` — upstream rejects function `tools` + reasoning together **on
@@ -241,4 +242,4 @@ pip install -r requirements.txt
   actually forwarded; it's gitignored and deleted at the end of the run.
 - Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log` (gitignored).
 - After changing proxy behavior, run `./.venv/bin/python test_proxy.py` and
-  confirm "ALL TESTS PASSED" (267 checks).
+  confirm "ALL TESTS PASSED" (283 checks).
