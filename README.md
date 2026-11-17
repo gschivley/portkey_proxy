@@ -407,7 +407,7 @@ line reads `sampling not supported upstream, adjusted: ...`.
 **`gpt-6-astra` rejects function tools on `/v1/chat/completions` entirely**
 
 Verified against the live Sandbox (2026-09-29): for the `gpt-6` family
-(`gpt-6-astra`, `gpt-6.1-sol`) there is **no** chat-completions request shape
+(`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra`) there is **no** chat-completions request shape
 that accepts function tools:
 
 | Sent with `tools` | Upstream result |
