@@ -257,11 +257,11 @@ Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
 
 ```json
 {"ts":"2026-09-16T09:51:02","month":"2026-09","model":"gpt-6.1-sol","upstream":"gpt-6.1-sol",
- "provider":"openai","pricing_model":"gpt-6-sol","stream":true,"prompt_tokens":12,
+ "provider":"openai","pricing_model":"gpt-6.1-sol","stream":true,"prompt_tokens":12,
  "cached_tokens":4,"cache_write_tokens":0,"completion_tokens":8,"reasoning_tokens":0,
  "total_tokens":20,"tokens_reported":true,
- "rates":{"input":0.0002,"output":0.001,"cache_read_input":2e-05,"cache_write_input":0.00025},
- "cost_usd":0.0000968}
+ "rates":{"input":0.0002,"output":0.001,"cache_read_input":1e-05,"cache_write_input":0.00025},
+ "cost_usd":0.0000964}
 ```
 
 - **Prices** come from `https://api.portkey.ai/model-configs/pricing/<provider>/<model>`
@@ -270,7 +270,7 @@ Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
   `cost_usd = tokens x price / 100`. Each record stores the rates applied, so
   history is auditable and never rewritten when prices change. Models with no
   catalog entry (the Sandbox deployment names differ, e.g. `gemini-3.8-flash`
-  is priced as `gemini-3.8-flash-gt-128k` and `gpt-6.1-sol` as `gpt-6-sol`) are
+  is priced as `gemini-3.8-flash-gt-128k`) are
   recorded with `cost_usd: null` and flagged in reports — requests are never
   blocked over tracking issues.
 - **Cost formula.** `cached_tokens` and `cache_write_tokens` are both subsets of
@@ -290,7 +290,7 @@ Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
   | Model (as requested) | Priced as | Input | Cached in | Cache write | Output |
   | ------------------------ | ----------- | -------: | -----------: | ------------: | -------: |
   | `gpt-6-astra` | `gpt-6-astra` | $10.00 | $1.00 | $12.50 | $50.00 |
-  | `gpt-6.1-sol` | `gpt-6-sol` | $2.00 | $0.20 | $2.50 | $10.00 |
+  | `gpt-6.1-sol` | `gpt-6.1-sol` | $2.00 | $0.10 | $2.50 | $10.00 |
   | `gpt-6.1-terra` | `gpt-6.1-terra` | $1.00 | $0.05 | $1.25 | $5.00 |
   | `gpt-6-luna` | `gpt-6-luna` | $0.01 | $0.001 | $0.0125 | $0.05 |
   | `gemini-3.8-flash` | `gemini-3.8-flash-gt-128k` | $0.75 | $0.075 | – | $3.75 |

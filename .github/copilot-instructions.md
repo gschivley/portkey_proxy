@@ -157,8 +157,8 @@ pip install -r requirements.txt
   (and the README table). Each entry also declares a `provider` (`openai`/
   `anthropic`/`google`) used for the pricing lookup; if the deployment's pricing
   name differs from its `upstream`, set a `pricing_model` (e.g. `gemini-3.8-flash`
-  -> `gemini-3.8-flash-gt-128k`, `gpt-6.1-sol` -> `gpt-6-sol`; both 404 under
-  their deployment name and would otherwise log `cost_usd: null`).
+  -> `gemini-3.8-flash-gt-128k`, which 404s under its deployment name and
+  would otherwise log `cost_usd: null`).
 - **Reasoning is per-model, not global**: `REASONING_PROFILES` captures three
   upstream quirks:
   - `gpt-5.6` — upstream rejects function `tools` + reasoning together **on

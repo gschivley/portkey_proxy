@@ -2070,10 +2070,10 @@ def main() -> int:
             and abs(sol[0]["cost_usd"] - mock_nosplit) < 1e-9,
             str(sol),
         )
-        # gpt-6.1-sol bills under the "gpt-6-sol" catalog entry.
+        # gpt-6.1-sol bills under its own "gpt-6.1-sol" catalog entry.
         check(
-            "usage: gpt-6.1-sol priced under gpt-6-sol catalog name",
-            bool(sol) and sol[0]["pricing_model"] == "gpt-6-sol",
+            "usage: gpt-6.1-sol priced under gpt-6.1-sol catalog name",
+            bool(sol) and sol[0]["pricing_model"] == "gpt-6.1-sol",
             str(sol[0].get("pricing_model") if sol else None),
         )
 
@@ -2248,7 +2248,7 @@ def main() -> int:
             cache = {}
         check(
             "usage: pricing cache populated (incl. negative)",
-            "openai/gpt-6-sol" in cache
+            "openai/gpt-6.1-sol" in cache
             and "openai/gpt-6.1-terra" in cache
             and (cache.get("anthropic/upstream-fable") or {}).get("rates") == {},
             str(sorted(cache)),

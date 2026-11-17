@@ -97,8 +97,8 @@ Configuration (local .env file next to this script, or environment):
     GEMINI4_ARGON_PRICING_MODEL    pricing-catalog model name for
                            gemini-4-argon (default gemini-4-argon-gt-128k)
     GPT6_SOL_PRICING_MODEL pricing-catalog model name for gpt-6.1-sol
-                           (default gpt-6-sol — the catalog has no entry under
-                           the deployment name)
+                           (default gpt-6.1-sol, the catalog's own entry; the
+                           deployment name is already the catalog name)
     GPT61_TERRA_PRICING_MODEL  pricing-catalog model name for gpt-6.1-terra
                            (default gpt-6.1-terra, the catalog's own entry; the
                            deployment name is already the catalog name)
@@ -358,9 +358,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         ),
         "provider": "openai",
         "sampling": False,
-        # The pricing catalog lists this deployment as "gpt-6-sol"; looking it
-        # up under the request name 404s and the call is logged without a cost.
-        "pricing_model": os.environ.get("GPT6_SOL_PRICING_MODEL", "gpt-6-sol"),
+        # The catalog lists this model under its own name (verified
+        # 2026-11-17). The older "gpt-6-sol" entry has a 2x cache-read rate, so
+        # it must not be used as the default.
+        "pricing_model": os.environ.get("GPT6_SOL_PRICING_MODEL", "gpt-6.1-sol"),
     },
     "gpt-6.1-terra": {
         "upstream": os.environ.get("GPT61_TERRA_UPSTREAM_MODEL", "gpt-6.1-terra"),
