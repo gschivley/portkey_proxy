@@ -76,6 +76,10 @@ Configuration (local .env file next to this script, or environment):
     GPT6_ASTRA_REASONING_EFFORTS   comma-separated reasoning_effort values the
                            upstream accepts for gpt-6-astra (default
                            low,medium,high,xhigh — 'none' is rejected there)
+    GPT61_TERRA_REASONING_EFFORTS  same, for gpt-6.1-terra (default
+                           low,medium,high,xhigh). gpt-6.1-sol deliberately
+                           reuses GPT6_ASTRA_REASONING_EFFORTS instead of
+                           having its own variable.
     GEMINI38_FLASH_REASONING_EFFORTS
     GEMINI4_ARGON_REASONING_EFFORTS
     CLAUDE_OPUS_55_REASONING_EFFORTS
