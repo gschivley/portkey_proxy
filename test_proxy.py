@@ -175,13 +175,10 @@ def main() -> int:
             and "claude-fable-5-2" in ids,
             str(r.json()),
         )
-        # Retired aliases must be gone from the listing. Their names are built
-        # from parts so this file never advertises them as live aliases.
-        retired_aliases = [
-            "gpt-5.6-" + "sol",
-            "gpt-5.6-" + "terra",
-            "claude-fable-5-" + "1",
-        ]
+        # Aliases retired in favour of gpt-6.1-terra / claude-fable-5-2.
+        # They must behave like any unknown model: absent from the listing and
+        # 404 model_not_found on both wire APIs (asserted in section 4).
+        retired_aliases = ["gpt-5.6-sol", "gpt-5.6-terra", "claude-fable-5-1"]
         check(
             "v1/models omits retired aliases",
             not any(alias in ids for alias in retired_aliases),
