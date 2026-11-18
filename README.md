@@ -13,6 +13,7 @@ Exposed models (by default):
 | `gpt-6-astra`                 | `gpt-6-astra`  |
 | `gpt-6.1-sol`                 | `gpt-6.1-sol`  |
 | `gpt-6.1-terra`               | `gpt-6.1-terra`|
+| `gpt-6.2-sol`                 | `gpt-6.2-sol`  |
 | `gpt-6-luna`                  | `gpt-6-luna`   |
 | `gemini-3.8-flash`            | `gemini-3.8-flash` |
 | `gemini-4-argon`              | `gemini-4-argon` |
@@ -26,7 +27,8 @@ Exposed models (by default):
 The Portkey aliases are passed through to Portkey as-is. If an alias is not a
 real deployment name on the sandbox, map it to a real model by setting the
 matching `*_UPSTREAM_MODEL` variable (e.g. `GPT61_TERRA_UPSTREAM_MODEL`,
-`GPT6_ASTRA_UPSTREAM_MODEL`, `GPT6_SOL_UPSTREAM_MODEL`, `GEMINI38_FLASH_UPSTREAM_MODEL`,
+`GPT6_ASTRA_UPSTREAM_MODEL`, `GPT6_SOL_UPSTREAM_MODEL`, `GPT62_SOL_UPSTREAM_MODEL`,
+`GEMINI38_FLASH_UPSTREAM_MODEL`,
 `GEMINI4_ARGON_UPSTREAM_MODEL`, `CLAUDE_OPUS_55_UPSTREAM_MODEL`, `CLAUDE_SONNET_55_UPSTREAM_MODEL`,
 `CLAUDE_FABLE_52_UPSTREAM_MODEL`; or editing
 `MODEL_REGISTRY` in `proxy.py`) — e.g. `claude-sonnet-4-6`.
@@ -144,8 +146,8 @@ For GitHub Copilot CLI the same settings map to environment variables:
 export COPILOT_PROVIDER_TYPE=openai
 export COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:8090/v1
 export COPILOT_PROVIDER_API_KEY=<your Portkey / AI Sandbox key>
-export COPILOT_MODEL=gpt-6.1-sol        # or gpt-6.1-terra / gpt-6-astra /
-                                        # gpt-6-luna /
+export COPILOT_MODEL=gpt-6.1-sol        # or gpt-6.1-terra / gpt-6.2-sol /
+                                        # gpt-6-astra / gpt-6-luna /
                                         # gemini-3.8-flash / gemini-4-argon /
                                         # claude-opus-5-5 /
                                         # claude-sonnet-5-5 / claude-fable-5-2
@@ -177,7 +179,7 @@ form, so the client still sees an ordinary `chat.completion`. See
 | Function tools | nested: `{"type":"function","function":{...}}` | **flat**: `{"type":"function","name":...,"parameters":...}` |
 | Reasoning | `reasoning_effort` (flat) | `reasoning: {"effort": ...}` (nested) |
 | Tools + reasoning on GPT-5.6 profile (`gpt-6-luna`) | **rejected upstream** — reasoning is stripped, with an auto-retry using `"none"` | **accepted**, reasoning forwarded untouched |
-| Tools on the gpt-6 profile (`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra`) | **rejected in every shape** — auto-bridged via Responses | **accepted** natively |
+| Tools on the gpt-6 profile (`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6.2-sol`) | **rejected in every shape** — auto-bridged via Responses | **accepted** natively |
 | NRP models (`qwen3`, `deepseek-v4-flash`, `glm-5`) | **accepted** natively | **broken upstream** — auto-bridged via chat completions (`responses_via_chat`) |
 | Stream terminator | `data: [DONE]` | `response.completed` event (no `[DONE]`) |
 | Usage fields | `prompt_tokens` / `completion_tokens` | `input_tokens` / `output_tokens` (normalised into the same `usage.jsonl` schema) |
@@ -292,6 +294,7 @@ Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
   | `gpt-6-astra` | `gpt-6-astra` | $10.00 | $1.00 | $12.50 | $50.00 |
   | `gpt-6.1-sol` | `gpt-6.1-sol` | $2.00 | $0.10 | $2.50 | $10.00 |
   | `gpt-6.1-terra` | `gpt-6.1-terra` | $1.00 | $0.05 | $1.25 | $5.00 |
+  | `gpt-6.2-sol` | `gpt-6.2-sol` | $2.00 | $0.10 | $2.50 | $10.00 |
   | `gpt-6-luna` | `gpt-6-luna` | $0.01 | $0.001 | $0.0125 | $0.05 |
   | `gemini-3.8-flash` | `gemini-3.8-flash-gt-128k` | $0.75 | $0.075 | – | $3.75 |
   | `gemini-4-argon` | `gemini-4-argon-gt-128k` | $2.00 | $0.10 | – | $10.00 |
@@ -301,7 +304,8 @@ Portkey's public pricing API, and appends one JSON line to `usage.jsonl`:
 
   A dash means the catalog has no rate for that cell, so it falls back to the
   plain input rate. Override a mapping with `<ALIAS>_PRICING_MODEL` (e.g.
-  `GPT6_SOL_PRICING_MODEL`) when the catalog renames a deployment.
+  `GPT6_SOL_PRICING_MODEL`, `GPT62_SOL_PRICING_MODEL`) when the catalog renames
+  a deployment.
 - **Streaming usage** arrives differently per upstream, so the proxy watches
   *every* `usage` block in a stream and keeps the highest value seen per field
   (`_StreamUsageTracker`), then logs one record when the stream ends. This
@@ -351,7 +355,7 @@ disagree about it. Each model in `MODEL_REGISTRY` declares a profile from
 | Profile | Models | Behaviour on `/v1/chat/completions` |
 | --------- | -------- | ----------- |
 | `gpt-5.6` | `gpt-6-luna` | Rejects function `tools` + reasoning together. The proxy strips reasoning when tools are present, and auto-retries with `reasoning_effort: "none"` if the upstream still complains. `"none"` **is** a valid value here. (On `/v1/responses` this profile has no conflict — reasoning is forwarded untouched.) Despite its name, `gpt-6-luna` behaves like this family, not the `gpt-6` one. |
-| `gpt-6` | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra` | **No chat-completions shape accepts function tools at all** (see below), so tools-bearing requests are bridged via `/v1/responses` by default. Without tools, `"none"` is **not** a valid effort — supported values are `low`, `medium`, `high`, `xhigh`, and unsupported client values are rewritten to the fallback `low`. |
+| `gpt-6` | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6.2-sol` | **No chat-completions shape accepts function tools at all** (see below), so tools-bearing requests are bridged via `/v1/responses` by default. Without tools, `"none"` is **not** a valid effort — supported values are `low`, `medium`, `high`, `xhigh`, and unsupported client values are rewritten to the fallback `low`. |
 | `flexible` | `gemini-3.8-flash`, `gemini-4-argon`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-2` | Accepts tools + reasoning and its own effort vocabulary, so values are forwarded untouched unless you configure an explicit list. |
 
 **"Function tools with reasoning_effort are not supported ... set reasoning_effort to 'none'"**
@@ -407,7 +411,7 @@ line reads `sampling not supported upstream, adjusted: ...`.
 **`gpt-6-astra` rejects function tools on `/v1/chat/completions` entirely**
 
 Verified against the live Sandbox (2026-09-29): for the `gpt-6` family
-(`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra`) there is **no** chat-completions request shape
+(`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6.2-sol`) there is **no** chat-completions request shape
 that accepts function tools:
 
 | Sent with `tools` | Upstream result |
@@ -583,9 +587,9 @@ existing reasoning strip/retry behavior.
 | `RESPONSES_ENABLED` | `1` | Serve `POST /v1/responses`. Set `0` to disable it (the route then returns a 404 stub, and bridging is disabled too) |
 | `TOOLS_VIA_RESPONSES` | `auto` | Serve chat requests with function tools through the Responses API and translate the reply back: `auto` (only models with no working chat shape for tools, i.e. the `gpt-6` family), `always` (also GPT-5.6, preserving its reasoning), `never` (forward the upstream 400) |
 | `TOOLS_REASONING_EFFORT` | `strip` | For models that reject tools + reasoning (GPT-5.6 only): `strip`, `none`, or `keep` (the alternative is auto-tried on the upstream's tools+reasoning 400) |
-| `GPT6_ASTRA_UPSTREAM_MODEL` / `GPT6_SOL_UPSTREAM_MODEL` / `GPT61_TERRA_UPSTREAM_MODEL` / `GPT6_LUNA_UPSTREAM_MODEL` / `GEMINI38_FLASH_UPSTREAM_MODEL` / `GEMINI4_ARGON_UPSTREAM_MODEL` | alias name | Map an alias to a different upstream model |
+| `GPT6_ASTRA_UPSTREAM_MODEL` / `GPT6_SOL_UPSTREAM_MODEL` / `GPT61_TERRA_UPSTREAM_MODEL` / `GPT62_SOL_UPSTREAM_MODEL` / `GPT6_LUNA_UPSTREAM_MODEL` / `GEMINI38_FLASH_UPSTREAM_MODEL` / `GEMINI4_ARGON_UPSTREAM_MODEL` | alias name | Map an alias to a different upstream model |
 | `QWEN3_UPSTREAM_MODEL` / `DEEPSEEK_V4_FLASH_UPSTREAM_MODEL` / `GLM5_UPSTREAM_MODEL` | alias name | Map an NRP alias to a different upstream model |
-| `GPT6_ASTRA_REASONING_EFFORTS` / `GPT61_TERRA_REASONING_EFFORTS` | `low,medium,high,xhigh` | Comma-separated `reasoning_effort` values the upstream accepts for `gpt-6-astra` / `gpt-6.1-terra`; unsupported client values are rewritten to the first non-`none` entry |
+| `GPT6_ASTRA_REASONING_EFFORTS` / `GPT61_TERRA_REASONING_EFFORTS` / `GPT62_SOL_REASONING_EFFORTS` | `low,medium,high,xhigh` | Comma-separated `reasoning_effort` values the upstream accepts for `gpt-6-astra` / `gpt-6.1-terra` / `gpt-6.2-sol`; unsupported client values are rewritten to the first non-`none` entry |
 | `GEMINI38_FLASH_REASONING_EFFORTS` / `GEMINI4_ARGON_REASONING_EFFORTS` / `CLAUDE_OPUS_55_REASONING_EFFORTS` / `CLAUDE_SONNET_55_REASONING_EFFORTS` / `CLAUDE_FABLE_52_REASONING_EFFORTS` | – (unset) | Optional comma-separated `reasoning_effort` list for `gemini-3.8-flash`, `gemini-4-argon` or a Claude model; when unset, client values are forwarded untouched |
 | `DEFAULT_REASONING_EFFORT` / `<ALIAS>_DEFAULT_REASONING_EFFORT` | `medium` | Default reasoning effort injected for Portkey models when the client harness omits one (`reasoning_effort` on chat, `reasoning.effort` on Responses). Set to `off` or `0` to disable |
 | `USAGE_TRACKING` | `1` | Record token usage and dollar cost of every request to the JSONL usage log |

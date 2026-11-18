@@ -19,7 +19,7 @@ pip install -r requirements.txt
 # Run the proxy (serves on 127.0.0.1:8090)
 ./.venv/bin/python proxy.py
 
-# Run the full integration test suite (283 checks; boots a mock upstream + the real proxy)
+# Run the full integration test suite (290 checks; boots a mock upstream + the real proxy)
 ./.venv/bin/python test_proxy.py
 ```
 
@@ -129,9 +129,9 @@ pip install -r requirements.txt
   `_chat_to_responses_kwargs`, `_responses_to_chat_completion` and
   `_ResponsesToChatSSE`, so the client never knows. `auto` bridges only models
   with `tools_on_chat: False` (the `gpt-6` profile — `gpt-6-astra`,
-  `gpt-6.1-sol` and `gpt-6.1-terra` — which reject tools on chat in every
-  shape; note `gpt-6-luna` is named like this family but uses the `gpt-5.6`
-  profile and is not bridged);
+  `gpt-6.1-sol`, `gpt-6.1-terra` and `gpt-6.2-sol` — which reject tools on chat
+  in every shape; note `gpt-6-luna` is named like this family but uses the
+  `gpt-5.6` profile and is not bridged);
   `always` also bridges GPT-5.6 (preserving its reasoning);
   `never` forwards the upstream 400. Requires `RESPONSES_ENABLED=1`. Log line:
   `chat request bridged via responses: ...`.
@@ -242,4 +242,4 @@ pip install -r requirements.txt
   actually forwarded; it's gitignored and deleted at the end of the run.
 - Logs go to `_mock.log`, `_proxy.log`, `_proxy2.log` (gitignored).
 - After changing proxy behavior, run `./.venv/bin/python test_proxy.py` and
-  confirm "ALL TESTS PASSED" (283 checks).
+  confirm "ALL TESTS PASSED" (290 checks).
