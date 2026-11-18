@@ -67,6 +67,7 @@ Configuration (local .env file next to this script, or environment):
     GPT6_ASTRA_UPSTREAM_MODEL    optional upstream model for gpt-6-astra
     GPT6_SOL_UPSTREAM_MODEL      optional upstream model for gpt-6.1-sol
     GPT61_TERRA_UPSTREAM_MODEL   optional upstream model for gpt-6.1-terra
+    GPT62_SOL_UPSTREAM_MODEL     optional upstream model for gpt-6.2-sol
     GPT6_LUNA_UPSTREAM_MODEL     optional upstream model for gpt-6-luna
     GEMINI38_FLASH_UPSTREAM_MODEL  optional upstream model for gemini-3.8-flash
     GEMINI4_ARGON_UPSTREAM_MODEL   optional upstream model for gemini-4-argon
@@ -80,6 +81,8 @@ Configuration (local .env file next to this script, or environment):
                            low,medium,high,xhigh). gpt-6.1-sol deliberately
                            reuses GPT6_ASTRA_REASONING_EFFORTS instead of
                            having its own variable.
+    GPT62_SOL_REASONING_EFFORTS  same, for gpt-6.2-sol (default
+                           low,medium,high,xhigh — 'none' is rejected there)
     GEMINI38_FLASH_REASONING_EFFORTS
     GEMINI4_ARGON_REASONING_EFFORTS
     CLAUDE_OPUS_55_REASONING_EFFORTS
@@ -101,6 +104,9 @@ Configuration (local .env file next to this script, or environment):
                            deployment name is already the catalog name)
     GPT61_TERRA_PRICING_MODEL  pricing-catalog model name for gpt-6.1-terra
                            (default gpt-6.1-terra, the catalog's own entry; the
+                           deployment name is already the catalog name)
+    GPT62_SOL_PRICING_MODEL pricing-catalog model name for gpt-6.2-sol
+                           (default gpt-6.2-sol, the catalog's own entry; the
                            deployment name is already the catalog name)
 
 Usage & cost tracking (see usage.py; GET /v1/usage, or run usage_report.py):
@@ -145,7 +151,7 @@ from portkey_ai._vendor.openai.resources.chat.completions.completions import (
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-PROXY_VERSION = "1.9.0"
+PROXY_VERSION = "1.10.0"
 
 # --------------------------------------------------------------------------- #
 # Environment / .env loading
@@ -378,6 +384,26 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         # (verified against the public pricing API 2026-11-16); the older
         # "gpt-6-terra" name 404s, so it must not be used as the default.
         "pricing_model": os.environ.get("GPT61_TERRA_PRICING_MODEL", "gpt-6.1-terra"),
+    },
+    # Successor to gpt-6.1-sol. Verified live 2026-11-18: same gpt-6 profile
+    # behaviour — 'none' is rejected (low/medium/high/xhigh only), no
+    # chat-completions shape accepts function tools, and /v1/responses takes
+    # tools + reasoning. Sampling knobs are rejected exactly like the rest of
+    # the gpt-* family.
+    "gpt-6.2-sol": {
+        "upstream": os.environ.get("GPT62_SOL_UPSTREAM_MODEL", "gpt-6.2-sol"),
+        "description": "Portkey/AI Sandbox model exposed to the Copilot app",
+        "reasoning": "gpt-6",
+        "efforts_env": "GPT62_SOL_REASONING_EFFORTS",
+        "default_effort": _parse_default_effort(
+            os.environ.get("GPT62_SOL_DEFAULT_REASONING_EFFORT"),
+            DEFAULT_REASONING_EFFORT,
+        ),
+        "provider": "openai",
+        "sampling": False,
+        # The catalog lists this model under its own name (verified
+        # 2026-11-18), at the same rates as gpt-6.1-sol.
+        "pricing_model": os.environ.get("GPT62_SOL_PRICING_MODEL", "gpt-6.2-sol"),
     },
     "gemini-3.8-flash": {
         "upstream": os.environ.get("GEMINI38_FLASH_UPSTREAM_MODEL", "gemini-3.8-flash"),

@@ -5,7 +5,7 @@ End-to-end integration test for proxy.py.
 Boots a mock Portkey-compatible upstream (mock_upstream.py) and the real
 proxy (proxy.py) as subprocesses, then verifies:
 
-  - model listing (gpt-6.1-sol / gpt-6.1-terra / gpt-6-luna)
+  - model listing (gpt-6.1-sol / gpt-6.1-terra / gpt-6.2-sol / gpt-6-luna)
   - non-streaming chat completions (JSON shape, alias -> upstream rewrite,
     auth injection, parameter forwarding, usage metadata)
   - streaming chat completions (SSE chunks, [DONE], final usage)
@@ -125,6 +125,7 @@ def main() -> int:
             "PORTKEY_BASE_URL": f"http://127.0.0.1:{mock_port}",  # no /v1: proxy must normalize
             "GPT6_SOL_UPSTREAM_MODEL": "upstream-sol",
             "GPT61_TERRA_UPSTREAM_MODEL": "upstream-terra",
+            "GPT62_SOL_UPSTREAM_MODEL": "upstream-sol-62",
             "GPT6_LUNA_UPSTREAM_MODEL": "upstream-luna",
             "GPT6_ASTRA_UPSTREAM_MODEL": "upstream-astra",
             "GEMINI38_FLASH_UPSTREAM_MODEL": "upstream-gemini",
@@ -168,6 +169,7 @@ def main() -> int:
             and "gpt-6-astra" in ids
             and "gpt-6.1-sol" in ids
             and "gpt-6.1-terra" in ids
+            and "gpt-6.2-sol" in ids
             and "gemini-3.8-flash" in ids
             and "gemini-4-argon" in ids
             and "claude-opus-5-5" in ids
@@ -302,6 +304,35 @@ def main() -> int:
         check(
             "gpt: accepted params (seed) still forwarded",
             cap["body"].get("seed") == 42,
+            str(cap["body"]),
+        )
+
+        # gpt-6.2-sol is a separate alias with its own upstream mapping; it
+        # must get the same gpt-6 treatment (sampling dropped, max_tokens
+        # renamed) and resolve to its own deployment.
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-6.2-sol",
+                "messages": [{"role": "user", "content": "Hi there"}],
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "max_tokens": 128,
+            },
+        )
+        check("gpt-6.2-sol with sampling params -> 200", r.status_code == 200, r.text)
+        cap = json.loads(CAPTURE.read_text())
+        check(
+            "gpt-6.2-sol: mapped to its own upstream",
+            cap["body"].get("model") == "upstream-sol-62",
+            str(cap["body"].get("model")),
+        )
+        check(
+            "gpt-6.2-sol: sampling dropped, max_tokens renamed",
+            "temperature" not in cap["body"]
+            and "top_p" not in cap["body"]
+            and cap["body"].get("max_completion_tokens") == 128
+            and "max_tokens" not in cap["body"],
             str(cap["body"]),
         )
 
@@ -1319,6 +1350,7 @@ def main() -> int:
 
         for alias, expected in (
             ("gpt-6.1-terra", None),
+            ("gpt-6.2-sol", None),
             ("claude-opus-5-5", "low"),
             ("claude-sonnet-5-5", None),
             ("claude-fable-5-2", "none"),
@@ -2077,6 +2109,26 @@ def main() -> int:
             str(sol[0].get("pricing_model") if sol else None),
         )
 
+        # gpt-6.2-sol likewise bills under its own catalog entry (verified
+        # against the public pricing API 2026-11-18).
+        r = client3.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-6.2-sol",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+        check("usage: gpt-6.2-sol request ok", r.status_code == 200, r.text)
+        sol62 = [x for x in usage_records() if x["model"] == "gpt-6.2-sol"]
+        check(
+            "usage: gpt-6.2-sol priced under its own catalog name",
+            len(sol62) == 1
+            and sol62[0]["pricing_model"] == "gpt-6.2-sol"
+            and sol62[0]["cost_usd"] is not None
+            and abs(sol62[0]["cost_usd"] - mock_nosplit) < 1e-9,
+            str(sol62),
+        )
+
         # Unknown pricing: request succeeds, cost stored as null.
         r = client3.post(
             "/v1/chat/completions",
@@ -2171,15 +2223,23 @@ def main() -> int:
             str(cw[0].get("rates")),
         )
 
-        # GET /v1/usage and /usage aggregation (seed + 6 tracked requests).
-        spent = 49.9999 + mock_in + mock_nosplit + mock_gem + mock_in + mock_cw
+        # GET /v1/usage and /usage aggregation (seed + 7 tracked requests).
+        spent = (
+            49.9999
+            + mock_in
+            + mock_nosplit
+            + mock_nosplit
+            + mock_gem
+            + mock_in
+            + mock_cw
+        )
         r = client3.get("/v1/usage")
         rep = r.json() if r.status_code == 200 else {}
         check("usage: GET /v1/usage -> 200", r.status_code == 200, r.text)
         check(
             "usage: month, request count and spend",
             rep.get("month") == month_now
-            and rep.get("requests") == 7
+            and rep.get("requests") == 8
             and abs(rep.get("spent_usd", 0) - spent) < 1e-6,
             str(rep),
         )
@@ -2197,6 +2257,7 @@ def main() -> int:
                 "seed-model",
                 "gpt-6.1-terra",
                 "gpt-6.1-sol",
+                "gpt-6.2-sol",
                 "gpt-6-luna",
                 "gpt-6-astra",
                 "claude-fable-5-2",
@@ -2212,7 +2273,7 @@ def main() -> int:
         r = client3.get("/usage")
         check(
             "usage: bare /usage aggregates the same",
-            r.status_code == 200 and r.json().get("requests") == 7,
+            r.status_code == 200 and r.json().get("requests") == 8,
             r.text,
         )
         r = client3.get("/v1/usage", params={"month": "2020-01"})
@@ -2250,6 +2311,7 @@ def main() -> int:
             "usage: pricing cache populated (incl. negative)",
             "openai/gpt-6.1-sol" in cache
             and "openai/gpt-6.1-terra" in cache
+            and "openai/gpt-6.2-sol" in cache
             and (cache.get("anthropic/upstream-fable") or {}).get("rates") == {},
             str(sorted(cache)),
         )
@@ -2337,7 +2399,7 @@ def main() -> int:
         rep = client3.get("/v1/usage").json()
         check(
             "usage: aggregate still counts every tracked request",
-            rep.get("requests") == 10,
+            rep.get("requests") == 11,
             str(rep.get("requests")),
         )
         check(
