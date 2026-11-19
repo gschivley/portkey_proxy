@@ -73,7 +73,6 @@ Configuration (local .env file next to this script, or environment):
     GEMINI4_ARGON_UPSTREAM_MODEL   optional upstream model for gemini-4-argon
     CLAUDE_OPUS_55_UPSTREAM_MODEL     optional upstream model for claude-opus-5-5
     CLAUDE_SONNET_55_UPSTREAM_MODEL   optional upstream model for claude-sonnet-5-5
-    CLAUDE_FABLE_52_UPSTREAM_MODEL    optional upstream model for claude-fable-5-2
     GPT6_ASTRA_REASONING_EFFORTS   comma-separated reasoning_effort values the
                            upstream accepts for gpt-6-astra (default
                            low,medium,high,xhigh — 'none' is rejected there)
@@ -87,7 +86,6 @@ Configuration (local .env file next to this script, or environment):
     GEMINI4_ARGON_REASONING_EFFORTS
     CLAUDE_OPUS_55_REASONING_EFFORTS
     CLAUDE_SONNET_55_REASONING_EFFORTS
-    CLAUDE_FABLE_52_REASONING_EFFORTS
                            comma-separated accepted reasoning_effort values
                            for those models (default: unset, so whatever
                            the client sends is forwarded untouched)
@@ -455,19 +453,6 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "efforts_env": "CLAUDE_SONNET_55_REASONING_EFFORTS",
         "default_effort": _parse_default_effort(
             os.environ.get("CLAUDE_SONNET_55_DEFAULT_REASONING_EFFORT"),
-            DEFAULT_REASONING_EFFORT,
-        ),
-        "provider": "anthropic",
-    },
-    "claude-fable-5-2": {
-        "upstream": os.environ.get(
-            "CLAUDE_FABLE_52_UPSTREAM_MODEL", "claude-fable-5-2"
-        ),
-        "description": "Anthropic Claude Fable 5.2 via the AI Sandbox",
-        "reasoning": "flexible",
-        "efforts_env": "CLAUDE_FABLE_52_REASONING_EFFORTS",
-        "default_effort": _parse_default_effort(
-            os.environ.get("CLAUDE_FABLE_52_DEFAULT_REASONING_EFFORT"),
             DEFAULT_REASONING_EFFORT,
         ),
         "provider": "anthropic",

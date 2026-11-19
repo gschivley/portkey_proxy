@@ -17,7 +17,7 @@ proxy (proxy.py) as subprocesses, then verifies:
     gpt-6-astra keeps tools+reasoning
     but rewrites unsupported values (e.g. "none" -> "low", or via a configured
     vocabulary); gemini-3.8-flash forwards effort values untouched; the
-    claude-opus-5-5 / claude-sonnet-5-5 / claude-fable-5-2 aliases use the same
+    claude-opus-5-5 / claude-sonnet-5-5 aliases use the same
     flexible profile
   - usage & cost tracking (usage.py): JSONL records for stream + non-stream
     calls with costs from the (mocked) pricing API, cached-token split,
@@ -131,7 +131,6 @@ def main() -> int:
             "GEMINI38_FLASH_UPSTREAM_MODEL": "upstream-gemini",
             "CLAUDE_OPUS_55_UPSTREAM_MODEL": "upstream-opus",
             "CLAUDE_SONNET_55_UPSTREAM_MODEL": "upstream-sonnet",
-            "CLAUDE_FABLE_52_UPSTREAM_MODEL": "upstream-fable",
             "INCLUDE_STREAM_USAGE": "1",
             # Blank the NRP key so a developer's real .env / shell export can
             # never leak into the default proxies (section 10 sets its own).
@@ -173,14 +172,19 @@ def main() -> int:
             and "gemini-3.8-flash" in ids
             and "gemini-4-argon" in ids
             and "claude-opus-5-5" in ids
-            and "claude-sonnet-5-5" in ids
-            and "claude-fable-5-2" in ids,
+            and "claude-sonnet-5-5" in ids,
             str(r.json()),
         )
-        # Aliases retired in favour of gpt-6.1-terra / claude-fable-5-2.
+        # Aliases retired in favour of gpt-6.1-terra / claude-sonnet-5-5.
         # They must behave like any unknown model: absent from the listing and
         # 404 model_not_found on both wire APIs (asserted in section 4).
-        retired_aliases = ["gpt-5.6-sol", "gpt-5.6-terra", "claude-fable-5-1"]
+        # claude-fable-5-2 was retired upstream (gateway returns unknown-model).
+        retired_aliases = [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "claude-fable-5-1",
+            "claude-fable-5-2",
+        ]
         check(
             "v1/models omits retired aliases",
             not any(alias in ids for alias in retired_aliases),
@@ -699,7 +703,6 @@ def main() -> int:
         for alias, upstream_name in (
             ("claude-opus-5-5", "upstream-opus"),
             ("claude-sonnet-5-5", "upstream-sonnet"),
-            ("claude-fable-5-2", "upstream-fable"),
         ):
             claude_body = {
                 "model": alias,
@@ -1239,7 +1242,6 @@ def main() -> int:
                 "DEFAULT_REASONING_EFFORT": "off",
                 "CLAUDE_OPUS_55_DEFAULT_REASONING_EFFORT": "low",
                 "CLAUDE_SONNET_55_DEFAULT_REASONING_EFFORT": "0",
-                "CLAUDE_FABLE_52_DEFAULT_REASONING_EFFORT": "none",
             }
         )
         proxy2_log = open(ROOT / "_proxy2.log", "w")
@@ -1353,7 +1355,6 @@ def main() -> int:
             ("gpt-6.2-sol", None),
             ("claude-opus-5-5", "low"),
             ("claude-sonnet-5-5", None),
-            ("claude-fable-5-2", "none"),
         ):
             for route, input_body in (
                 ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}]}),
@@ -2130,19 +2131,20 @@ def main() -> int:
         )
 
         # Unknown pricing: request succeeds, cost stored as null.
+        # anthropic is absent from the mock catalog, so any Claude alias works.
         r = client3.post(
             "/v1/chat/completions",
             json={
-                "model": "claude-fable-5-2",
+                "model": "claude-opus-5-5",
                 "messages": [{"role": "user", "content": "Hi"}],
             },
         )
         check("usage: unpriced model request ok", r.status_code == 200, r.text)
-        fab = [x for x in usage_records() if x["model"] == "claude-fable-5-2"]
+        unpriced = [x for x in usage_records() if x["model"] == "claude-opus-5-5"]
         check(
             "usage: unpriced model recorded with cost null",
-            len(fab) == 1 and fab[0]["cost_usd"] is None,
-            str(fab),
+            len(unpriced) == 1 and unpriced[0]["cost_usd"] is None,
+            str(unpriced),
         )
 
         # gemini is priced under its catalog name (pricing_model override).
@@ -2260,7 +2262,7 @@ def main() -> int:
                 "gpt-6.2-sol",
                 "gpt-6-luna",
                 "gpt-6-astra",
-                "claude-fable-5-2",
+                "claude-opus-5-5",
                 "gemini-3.8-flash",
             },
             str(rep.get("models")),
@@ -2298,7 +2300,7 @@ def main() -> int:
         )
         check(
             "usage: missing-pricing warning logged",
-            "no pricing for anthropic/upstream-fable" in p3log,
+            "no pricing for anthropic/upstream-opus" in p3log,
             p3log[-300:],
         )
 
@@ -2312,7 +2314,7 @@ def main() -> int:
             "openai/gpt-6.1-sol" in cache
             and "openai/gpt-6.1-terra" in cache
             and "openai/gpt-6.2-sol" in cache
-            and (cache.get("anthropic/upstream-fable") or {}).get("rates") == {},
+            and (cache.get("anthropic/upstream-opus") or {}).get("rates") == {},
             str(sorted(cache)),
         )
 
