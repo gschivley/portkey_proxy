@@ -188,7 +188,7 @@ async def chat_completions(request: Request):
                 and ptype == "image_url"
                 and any(
                     name in model
-                    for name in ("claude", "opus", "sonnet", "fable")
+                    for name in ("claude", "opus", "sonnet")
                 )
             ):
                 return JSONResponse(
